@@ -2,7 +2,7 @@ library(dplyr)
 library(ggplot2)
 library(scales)
 
-setwd("C:/Users/w10197812/OneDrive - The University of Southern Mississippi/Dissertation/Flounder Project")
+
 flounder.env<-read.csv("flounder_env.csv")
 flounder.env <- flounder.env %>%
   mutate(Date = as.POSIXct(Date, tz = "UTC"))
