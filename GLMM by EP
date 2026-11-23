@@ -1,0 +1,116 @@
+flounder.env<-read.csv("flounder_env.csv")
+
+library(dplyr)
+library(lubridate)
+
+flounder.env.clean <- flounder.env %>%
+  mutate(
+    Date = as.Date(parse_date_time(Date, orders = c("ymd", "mdy", "dmy"))),
+    DATE_TAGGED = as.Date(parse_date_time(
+      DATE_TAGGED, orders = c("ymd", "mdy", "dmy")
+    )),
+    In_Off = as.character(In_Off)
+  ) %>%
+  filter(!is.na(Date), !is.na(DATE_TAGGED)) %>%
+  arrange(Full.ID, Date)
+
+
+fish.past.winter <- flounder.env.clean %>%
+  group_by(Full.ID) %>%
+  summarise(
+    DATE_TAGGED = first(DATE_TAGGED),
+    Detected_Next_Year = any(year(Date) > year(first(DATE_TAGGED))),
+    .groups = "drop"
+  ) %>%
+  filter(Detected_Next_Year) %>%
+  pull(Full.ID)
+
+flounder.env.clean <- flounder.env.clean %>%
+  filter(Full.ID %in% fish.past.winter)
+
+transitions <- flounder.env.clean %>%
+  group_by(Full.ID) %>%
+  arrange(Date, .by_group = TRUE) %>%
+  mutate(
+    Previous_Habitat = lag(In_Off),
+    Previous_Date = lag(Date),
+    Days_Between = as.numeric(Date - Previous_Date)
+  ) %>%
+  filter(
+    Previous_Habitat == "Inshore",
+    In_Off == "Offshore",
+    Days_Between >= 0,
+    Days_Between <= 14
+  ) %>%
+  group_by(Full.ID) %>%
+  slice_min(Date, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(
+    Full.ID,
+    Transition_Date = Date,
+    Previous_Date,
+    Days_Between
+  )
+
+
+flounder.transition <- flounder.env.clean %>%
+  inner_join(transitions, by = "Full.ID") %>%
+  filter(
+    Date >= Transition_Date - 14,
+    Date <= Transition_Date + 14
+  ) %>%
+  arrange(Full.ID, Date)
+
+flounder.daily <- flounder.transition %>%
+  group_by(Full.ID, Date) %>%
+  summarise(
+    Inshore_Detections = sum(In_Off == "Inshore", na.rm = TRUE),
+    Offshore_Detections = sum(In_Off == "Offshore", na.rm = TRUE),
+    Total_Detections = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    In_Off = case_when(
+      Inshore_Detections > Offshore_Detections ~ "Inshore",
+      Offshore_Detections > Inshore_Detections ~ "Offshore",
+      TRUE ~ NA_character_
+    )
+  )
+
+flounder.daily <- flounder.daily %>%
+  left_join(
+    flounder.transition %>%
+      group_by(Full.ID, Date) %>%
+      summarise(
+        Pres = first(Pres),
+        Pres.range = first(Pres.range),
+        Gage = first(Gage),
+        Temp = first(Temp),
+        est.sal = first(est.sal),
+        .groups = "drop"
+      ),
+    by = c("Full.ID", "Date")
+  )
+
+flounder.model <- flounder.daily %>%
+  filter(
+    !is.na(In_Off),
+    complete.cases(Pres, Pres.range, Gage, Temp, est.sal)
+  ) %>%
+  mutate(
+    Offshore = ifelse(In_Off == "Offshore", 1, 0),
+    Pres_z = as.numeric(scale(Pres)),
+    Pres.range_z = as.numeric(scale(Pres.range)),
+    Gage_z = as.numeric(scale(Gage)),
+    Temp_z = as.numeric(scale(Temp)),
+    Sal_z = as.numeric(scale(est.sal))
+  )
+
+model.optionA <- glmer(
+  Offshore ~ Pres_z + Pres.range_z + Gage_z +
+    Temp_z + Sal_z + (1 | Full.ID),
+  data = flounder.model,
+  family = binomial
+)
+
+summary(model.optionA)
