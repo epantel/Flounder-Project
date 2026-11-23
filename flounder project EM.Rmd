@@ -1,0 +1,1670 @@
+---
+title: "Flounder Project"
+author: "Evelyn Pantelopoulos - Ethan Edits"
+date: "2026-09-30"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+
+```{r download data}
+setwd("~/Downloads/Methods&Analyses Fisheries/Flounder")
+flounder.det<-read.csv("Flounder_dets.csv")
+flounder.tagspec<-read.csv("Flounder_Tag_Meta_Combined.csv")
+
+library(dplyr)
+library(lubridate)
+
+flounder.tagspec<-flounder.tagspec %>%
+  mutate(
+    DateTime = mdy(DATE_TAGGED),
+    Date = as.Date(DateTime),
+    Full.ID = TRANSMITTER)
+
+flounder.det2 <- full_join(
+  
+  flounder.det, flounder.tagspec, by = "Full.ID")
+
+
+
+flounder.det2<- flounder.det2 %>%
+  mutate(
+    Est.Tag.Death = Date + EST_TAG_LIFE
+  )
+```
+
+
+
+```{r checking for weird detections} 
+#
+flounder.det2$DateTime <- ymd_hms(
+  flounder.det2$Time..UTC.,
+  tz = "UTC"
+)
+flounder.det2$det.Date <- as.Date(flounder.det2$Time..UTC.)
+
+flounder.det2 <- flounder.det2 %>%
+  group_by(Full.ID) %>%
+  mutate(
+    last.det = max(DateTime, na.rm = TRUE)
+  )
+  
+post.death.summary <- flounder.det2 %>%
+  filter(DateTime > Est.Tag.Death) %>%
+  group_by(Full.ID) %>%
+  summarise(
+    n_post_death = n(),
+    stations = paste(unique(Station), collapse = ", "),
+    first_post_death = min(DateTime, na.rm = TRUE),
+    last_post_death = max(DateTime, na.rm = TRUE),
+    est_tag_death = first(Est.Tag.Death),
+    time_after_death = last_post_death - est_tag_death,
+    .groups = "drop"
+  )
+
+#check for detections on DateTime after est.tag.death
+#Full.ID
+#last date of detection on DateTime -> last.det
+#number of detections after est tag death unique(DateTime)
+#unique(Station) detected after est.tag.death 
+#grace period is 3-4 months > last.det
+
+#questionable fish
+  dead1<-subset(flounder.det2, Full.ID == "A69-1602-60632") #not dead
+  
+  fake1<-subset(flounder.det2, Full.ID == "A69-1602-60636") #actually real
+  
+  fake2<-subset(flounder.det2, Full.ID == "A69-1602-60671") #any detection after 11/2021 is probably fake 
+   
+  fake3<-subset(flounder.det2, Full.ID == "A69-1602-60681") #anything after 4/2022 is probs fake
+  
+  fake4<-subset(flounder.det2, Full.ID == "A69-1602-60693") #FAKE BITCH alll of 1 detection
+  
+#removing fake detections
+flounder.det3 <- flounder.det2 %>%
+  filter(
+    !(Full.ID == "A69-1602-60671" & DateTime > ymd_hms("2021-11-19 23:59:59", tz = "UTC")),
+    !(Full.ID == "A69-1602-60681" & DateTime > ymd_hms("2022-04-18 23:59:59", tz = "UTC")),
+    Full.ID != "A69-1602-60693")
+
+#simultaneous detections
+#group by Full.ID
+#detections (DateTime) within seconds/min of each other 
+#Station on those detections 
+#stations preceding proceeding the simultaneous ones to filter out fake 
+
+simultaneous.det <- flounder.det2 %>%
+  arrange(Full.ID, DateTime) %>%
+  group_by(Full.ID) %>%
+  mutate(
+    next.time = lead(DateTime),
+    next.station = lead(Station),
+    time.diff.min = as.numeric(
+      difftime(next.time, DateTime, units = "min")
+    )
+  ) %>%
+  filter(
+    time.diff.min <= 3,
+    Station != next.station
+  ) %>%
+  ungroup()
+simultaneous.det2 <- simultaneous.det %>%
+  transmute(
+    Full.ID,
+    DateTime = DateTime,
+    preceding_station = Station,
+    following_station = next.station,
+    time_diff_min = time.diff.min
+  )
+simultaneous.det3 <- simultaneous.det2 %>%
+  filter(
+    sub("_*", "", preceding_station) ==
+    sub("_*", "", following_station)
+  )
+#checking to see if there are any obvious simultaneous detections based on detections not within the same waterbody
+simultaneous.det3 <- simultaneous.det %>%
+  filter(
+    sub("_*", "", Station) ==
+    sub("_*", "", next.station)
+  )
+
+#Receiver Serial without Station
+#102350
+#136874
+#136875 could be MSS_GPC_LT_33
+#129024 could be MSS_WG_Green_11? most likely not
+
+
+
+#some tags that did not get detected
+#A69-1602-60648
+#A69-1602-60701
+#A69-1602-60713
+#A69-1602-60718
+#A69-1604-9081
+
+
+flounder.det.clean<-flounder.det3 %>%
+  filter(
+    Full.ID != "A69-1602-60648",
+    Full.ID!="A69-1602-60701",
+    Full.ID != "A69-1602-60713",
+    Full.ID !="A69-1602-60718",
+    Full.ID!= "A69-1604-9081"
+  )
+
+```
+
+
+```{r system detections}
+#this code just checks for system transitions and how long it took the fish to be detected there. 
+#i usually sort by time in descending order and give a brief look at the station changes just to see if some make sense
+# long times inbetween stations are not uncommon for marine/esturarine fish that may travel offshore
+#but long times in between inshore stations can be a red flag
+
+system.transitions <- flounder.det.clean %>%
+  arrange(Full.ID, DateTime) %>%
+  group_by(Full.ID) %>%
+  mutate(
+    from_station = lag(Station),
+    from_time = lag(DateTime),
+    from_system = lag(sub("_.*", "", Station)),
+    
+    to_station = Station,
+    to_time = DateTime,
+    to_system = sub("_.*", "", Station),
+    
+    time_minutes = as.numeric(
+      difftime(to_time, from_time, units = "mins")
+    ),
+    
+    time_hours = as.numeric(
+      difftime(to_time, from_time, units = "hours")
+    )
+  ) %>%
+  ungroup() %>%
+  filter(
+    !is.na(from_station),
+    from_system != to_system
+  ) %>%
+  select(
+    Full.ID,
+    from_system,
+    from_station,
+    from_time,
+    to_system,
+    to_station,
+    to_time,
+    time_minutes,
+    time_hours
+  ) %>%
+ungroup()
+
+system.transitions2 <- flounder.det.clean %>%
+  mutate(
+    Station   = trimws(Station),
+    sys_group = case_when(
+      is.na(Station) | Station == "" ~ NA_character_,
+      grepl("LT", Station)           ~ "BI",
+      TRUE                           ~ sub("_.*", "", Station)
+    )
+  ) %>%
+  arrange(Full.ID, DateTime) %>%
+  group_by(Full.ID) %>%
+  mutate(
+    from_station = lag(Station),
+    from_time    = lag(DateTime),
+    from_system  = lag(sys_group),
+
+    to_station   = Station,
+    to_time      = DateTime,
+    to_system    = sys_group,
+
+    time_minutes = as.numeric(difftime(to_time, from_time, units = "mins")),
+    time_hours   = as.numeric(difftime(to_time, from_time, units = "hours"))
+  ) %>%
+  ungroup() %>%
+  filter(
+    !is.na(from_station),
+    !is.na(from_system),
+    !is.na(to_system),
+    from_system != to_system
+  ) %>%
+  select(Full.ID, from_system, from_station, from_time,
+         to_system, to_station, to_time, time_minutes, time_hours)
+
+
+
+flounder.det.clean <- flounder.det.clean %>%
+  filter(
+    !(Full.ID == "A69-1602-60674" & DateTime > ymd_hms("2022-07-16 23:59:59", tz = "UTC")),
+    !(Full.ID == "A69-1602-60681" & DateTime > ymd_hms("2022-08-09 23:59:59", tz = "UTC")))
+
+write_csv(flounder.det.clean, "flounder.det.clean.csv")
+
+#A69-1602-60674 7/17/2022 PR_Cumbest probs fake
+#A69-1602-60704 8/10/2022 PR_Cumbest probs fake 
+
+movin.flounda<-unique(system.transitions$Full.ID)
+flounda<-unique(flounder.det.clean$Full.ID)
+
+
+movin.flounda2 <- data.frame(
+  Full.ID = flounda[!flounda %in% movin.flounda]
+)
+
+
+
+```
+
+
+```{r station lats and longs for mapping}
+
+
+station.locations <- flounder.det.clean %>%
+  ungroup()%>%
+  select(Station, Latitude, Longitude) %>%
+  distinct() 
+
+ setwd("C:/Users/w10197812/OneDrive - The University of Southern Mississippi/Dissertation/Flounder Project")
+# write.csv(station.locations, "station.locations.csv", row.names = FALSE)
+
+stations<-read.csv("stations.csv")
+
+flounder.det.clean <- flounder.det.clean %>%
+  left_join(
+    stations %>% select(Station, RecGroup),
+    by = "Station"
+  )
+
+recgroup.transitions <- flounder.det.clean %>%
+  arrange(Full.ID, DateTime) %>%
+  group_by(Full.ID) %>%
+  mutate(
+    from_station = lag(RecGroup),
+    from_time = lag(DateTime),
+    #from_system = lag(sub("_.*", "", Station)),
+    
+    to_station = RecGroup,
+    to_time = DateTime,
+    #to_system = sub("_.*", "", Station),
+    
+    time_minutes = as.numeric(
+      difftime(to_time, from_time, units = "mins")
+    ),
+    
+    time_hours = as.numeric(
+      difftime(to_time, from_time, units = "hours")
+    )
+  ) %>%
+  ungroup() %>%
+  filter(
+    !is.na(from_station),
+    from_station != to_station
+  ) %>%
+  select(
+    Full.ID,
+    #from_system,
+    from_station,
+    from_time,
+    #to_system,
+    to_station,
+    to_time,
+    time_minutes,
+    time_hours
+  ) %>%
+ungroup()
+
+movin.flounda<-unique(recgroup.transitions$Full.ID)
+flounda<-unique(flounder.det.clean$Full.ID)
+
+
+movin.flounda2 <- data.frame(
+  Full.ID = flounda[!flounda %in% movin.flounda]
+)
+
+
+#A69-1602-60689 hmmmmmmm
+#A69-1602-60687 only 3 days detections
+
+#look for fish that have been detected on same receiver for more than 7 days consecutively?? and no other detections on any other reciever post 7 days. 
+#remove fish that were detected at the same staion for the whole time. min and max time between detections
+
+```
+
+
+```{r loading environmental data} 
+library(dataRetrieval) #USGS Data
+library(riem) #Pressure data
+
+#Locations
+#USGS-301429089145600 - Merrill Shell Bank Light * 164 salinity data points (daily)
+#USGS-301527088521500 - East Ship Island Light  - 25 salinity data points (daily)
+#USGS-302318088512600 - Biloxi Bay Point Cadet - some salinity data
+#USGS-301849088350000 - Round Island Light * - 0 salinity data points
+#USGS-0248018020 - Escatawpa River - no salinity
+#USGS-02480590 - Tchoutacabouffa River - no salinity
+#USGS-02481130 - Biloxi River - no salinity
+#USGS-02481521 - Wolf River - no salinity 
+# USGS-02481660 - Jourdan River - no salinity
+#USGS-301912088583300 MISSISSIPPI SOUND AT USGS GULFPORT LIGHT *
+#USGS-02489500 - Pearl River Bogalusa
+#USGS-02479310 - Pascagoula River Graham Ferry
+
+#Parameter Codes
+#00060 - River Discharge
+#00010 - Temp
+#00480 - Salinity
+#00095 - Conductivity
+
+#Time Frame
+# 1st data point - 2021/8/5
+# last data point (That we kept) - 2024/3/31
+# last data point - 2026/5/23
+
+MSB <- read_waterdata_continuous(monitoring_location_id = "USGS-301429089145600",
+                                 parameter_code = c("00010", "00095"),
+                                 time = c("2021-08-01", "2024-03-31"))
+
+RIL <- read_waterdata_continuous(monitoring_location_id = "USGS-301849088350000",
+                                 parameter_code = c("00010", "00095"),
+                                 time = c("2021-08-01", "2024-03-31"))
+
+GPTL <- read_waterdata_continuous(monitoring_location_id = "USGS-301912088583300",
+                                 parameter_code = c("00010", "00480"),
+                                 time = c("2021-08-01", "2024-03-31"))
+
+PRL <- read_waterdata_continuous(monitoring_location_id = "USGS-02489500",
+                                 parameter_code = c("00060"),
+                                 time = c("2021-08-01", "2024-03-31"))
+
+PAS <- read_waterdata_continuous(monitoring_location_id = "USGS-02479310",
+                                 parameter_code = c("00060"),
+                                 time = c("2021-08-01", "2024-03-31"))
+
+MSB2 <- read_waterdata_daily(monitoring_location_id = "USGS-301429089145600",
+                                 parameter_code = c("00010", "00480"),
+                                 time = c("2021-08-01", "2024-03-31"))
+
+
+RIL <- RIL %>%
+  mutate(
+    value = if_else(unit_of_measure == "uS/cm", value * 0.64 / 1000, value),
+    unit_of_measure = if_else(unit_of_measure == "uS/cm", "ppt", unit_of_measure)
+  )
+
+MSB <- MSB %>%
+  mutate(
+    value = if_else(unit_of_measure == "uS/cm", value * 0.64 / 1000, value),
+    unit_of_measure = if_else(unit_of_measure == "uS/cm", "ppt", unit_of_measure)
+  )
+
+PASC <- rbind(RIL, PAS)
+
+PASC_wide <- PASC %>%
+  pivot_wider(
+    id_cols     = time,
+    names_from  = unit_of_measure,
+    values_from = value
+  )
+
+BSL <- rbind(MSB, PRL)
+
+BSL_wide <- BSL %>%
+  pivot_wider(
+    id_cols     = time,
+    names_from  = unit_of_measure,
+    values_from = value
+  )
+
+GPT_wide <- GPTL %>%
+  pivot_wider(
+    id_cols     = time,
+    names_from  = unit_of_measure,
+    values_from = value
+  )
+
+env <- rbind(GPTL, MSB, PAS, PRL, RIL)
+
+env <- env %>%
+  mutate(
+    value = if_else(unit_of_measure == "uS/cm", value * 0.64 / 1000, value),
+    unit_of_measure = if_else(unit_of_measure == "uS/cm", "ppt", unit_of_measure)
+  )
+
+env_wide <- env %>%
+  group_by(time, unit_of_measure) %>%
+  summarise(value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(
+    id_cols     = time,
+    names_from  = unit_of_measure,
+    values_from = value
+  ) %>%
+  drop_na()
+
+pressure.dat <- read.csv("pressuredat.csv", header = T)
+
+pressure.dat <- pressure.dat %>%
+  filter(station == "BIX")
+
+write_csv(PASC_wide, "PASC.env.csv")
+write_csv(BSL_wide, "BSL.env.csv")
+
+
+#Daily Averages
+
+PASC.env <- read_csv("PASC.env.csv")
+BSL.env <- read_csv("BSL.env.csv")
+
+library(lubridate)
+
+Pasc_daily <- PASC.env %>%
+  mutate(date = as_date(time)) %>%
+  group_by(date) %>%
+  summarise(
+    n_obs = n(),
+    across(-time, ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.nan(.x), NA, .x)))
+
+BSL_daily <- BSL.env %>%
+  mutate(date = as_date(time)) %>%
+  group_by(date) %>%
+  summarise(
+    n_obs = n(),
+    across(-time, ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.nan(.x), NA, .x)))
+
+env_daily <- env_wide %>%
+  mutate(date = as_date(time)) %>%
+  group_by(date) %>%
+  summarise(
+    n_obs = n(),
+    across(-time, ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.nan(.x), NA, .x)))
+
+pressure_daily <- pressure.dat %>%
+  mutate(
+    valid = ymd_hm(valid, tz = "UTC"),   
+    mslp  = as.numeric(mslp),           
+    date  = as_date(valid)
+  ) %>%
+  group_by(date) %>%
+  summarise(
+    n_obs = sum(!is.na(mslp)),
+    mslp  = mean(mslp, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(mslp = ifelse(is.nan(mslp), NA, mslp))
+
+
+Pasc_final <- Pasc_daily %>%
+  left_join(
+    pressure_daily %>% select(date, mslp),
+    by = "date"
+  )
+
+BSL_final <- BSL_daily %>%
+  left_join(
+    pressure_daily %>% select(date, mslp),
+    by = "date"
+  )
+
+env_final <- env_daily %>%
+  left_join(
+    pressure_daily %>% select(date, mslp),
+    by = "date"
+  )
+
+#Standard Error
+
+se_T <- sd(env_daily$degC)/sqrt(length(env_daily$degC))
+se_D <- sd(env_daily$`ft^3/s`)/sqrt(length(env_daily$`ft^3/s`))
+se_S <- sd(env_daily$ppt)/sqrt(length(env_daily$ppt))
+se_P <- sd(pressure_daily$mslp)/sqrt(length(pressure_daily$mslp))
+
+```
+
+Objective 1
+```{r Objective 1: GLMM: relating env metrics to movement to barrier islands}
+### NEED TO RECLASS THE BARRIER ISLANDS (system.tranistions2), NEED MEAN DAILYS FOR ALL ENV (env_daily) FILTER OUT FLOUNDER THAN MOVED FASTER THAN 9 HOURS & GREATER THAN 72 HOURS
+
+### NEED TO REDO THE GLMM W/ THE FLOUNDER DETECTIONS DATA BC WE CANNOT TRUNCATE THE DATA W/ SYS TRANS
+    #Add teh 0s and 1s to the detections based on the reciever that it is at
+    #We are only using the day detections and not the hourly
+
+### Create abacus plots but do a few different ones to separate out the fish
+
+flounder.det.clean <- read_csv("flounder.det.clean.csv")
+
+#Daily Detections
+
+daily_dets <- flounder.det.clean %>%
+  mutate(
+    Station = trimws(Station),
+    date    = as_date(DateTime)
+  ) %>%
+  distinct(Full.ID, date, Station)     #If I only want 1 detection per day use this line
+
+#Add systems to each station
+
+daily_dets <- daily_dets %>%
+  mutate(
+    Station   = trimws(Station),
+    System = case_when(
+      is.na(Station) | Station == "" ~ NA_character_,
+      grepl("LT", Station)           ~ "BI",
+      TRUE                           ~ sub("_.*", "", Station)))
+  
+#Add 0s and 1s
+
+daily_dets <- daily_dets %>%
+  mutate(binomial = if_else(System == "BI", 1,0))
+
+#Abacus Plots
+
+ggplot(daily_dets, aes(x = date, y = Full.ID, color = System)) +
+  geom_point(size = 1.5) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%b %Y") +
+  labs(x = "Date", y = "Animal (Full.ID)", color = "System") +
+  theme_bw() +
+  theme(
+    axis.text.y = element_text(size = 3),
+    axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggplot(daily_dets, aes(x = date, y = Full.ID, color = System)) +
+  geom_point(size = 1.5) +
+  facet_wrap(~ System, scales = "free_y", ncol = 2) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%b %Y") +
+  labs(x = "Date", y = "Animal (Full.ID)", color = "System") +
+  theme_bw() +
+  theme(
+    axis.text.y = element_text(size = 3),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+# Keep only the fish that are actually moving based on sys.tran2 and remove the fish with super short <9 hr, and super long >72 hour transit times also based on sys.tran2. Also need to remove fish that didnt travel to BI based on sys.tran2
+
+#Adding 0s and 1s column to system transition data frame for binomial
+
+system.transitions2 <- system.transitions2 %>%
+  mutate(BI_flag = if_else(to_system == "BI", 1, 0))
+
+ToBI <- system.transitions2 %>%
+  filter(BI_flag == 1)
+
+ToBI2 <- ToBI %>%
+  filter(between(time_hours, 9, 72))
+
+dets_toBI <- daily_dets %>%
+  semi_join(ToBI2, by = "Full.ID")
+
+dets_toBI <- dets_toBI %>% drop_na()
+
+write_csv(dets_toBI, "dets_toBI.csv")
+  
+dets_toBI <- read.csv("dets_toBI.csv")
+
+# Need to remove the detections from when the fish goes back from BI to another system
+#16 unique fish 
+
+dets_toBI2 <- dets_toBI %>%       
+  arrange(Full.ID, date) %>%
+  group_by(Full.ID) %>%
+  filter(first(binomial) == 0) %>%        #removes fish that start at BI
+  mutate(
+    reached_BI  = cumsum(binomial == 1) > 0,     # TRUE from the first BI row onward
+    left_BI     = reached_BI & binomial == 0,    # a non-BI row after reaching BI
+    after_leave = cumsum(left_BI) > 0           # TRUE from the first departure onward
+  ) %>%
+  filter(!after_leave) %>%
+  ungroup() %>%
+  select(-reached_BI, -left_BI, -after_leave)
+
+
+#Abacus Plot of fish selected for objective 1
+
+ggplot(dets_toBI, aes(x = date, y = Full.ID, color = System)) +
+  geom_point(size = 1.5) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%b %Y") +
+  labs(x = "Date", y = "Animal (Full.ID)", color = "System") +
+  theme_bw() +
+  theme(
+    axis.text.y = element_text(size = 6),
+    axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  #After removing the movement back from barrier islands
+
+ggplot(dets_toBI2, aes(x = date, y = Full.ID, color = System)) +
+  geom_point(size = 1.5) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%b %Y") +
+  labs(x = "Date", y = "Animal (Full.ID)", color = "System") +
+  theme_bw() +
+  theme(
+    axis.text.y = element_text(size = 6),
+    axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+#Logistic Regression Plots
+ggplot(dets_toBI2, aes(x = date, y = binomial, color = Full.ID)) +
+  geom_point(size = 1.5) +
+  scale_x_date(date_labels = "%b %Y") +
+  labs(x = "Date", y = "Location", color = "Fish") +
+  theme_bw() +
+  theme(
+    axis.text.y = element_text(size = 6),
+    axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+#Combine detections with env data
+
+dets_toBI3 <- left_join(dets_toBI2, env_final, by = "date")
+
+
+  #With Regression Analysis (THIS NEEDS WORK)
+
+ggplot(dets_toBI3, aes(x = date, y = binomial, color = Full.ID)) +
+  geom_point(size = 1.5) +
+  geom_smooth(#aes(group = 1), color = "black",
+              method = "glm",
+              method.args = list(family = "binomial"),
+              se = TRUE) +
+  scale_x_date(date_labels = "%b %Y") +
+  labs(x = "Date", y = "Probability of location (0/1)", color = "Fish") +
+  theme_bw() +
+  theme(
+    axis.text.y = element_text(size = 6),
+    axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+# Logistic regression (date converted to numeric)
+dets_toBI3$date_num <- as.numeric(dets_toBI3$date)
+
+obj1.1 <- glm(binomial ~ date_num, data = dets_toBI3, family = binomial)
+summary(obj1.1)
+
+# Odds ratio per day, with 95% CI
+exp(cbind(OR = coef(obj1.1), confint(obj1.1)))
+
+
+library(lme4)
+
+# Scaling date helps the model converge
+dets_toBI3$date_scaled <- scale(dets_toBI3$date_num)
+
+obj1.2 <- glmer(binomial ~ date_scaled + (1 | Full.ID),
+            data = dets_toBI3, family = binomial)
+summary(obj1.2)
+
+
+dets_toBI3$pred <- predict(obj1.2, type = "response", re.form = NA)  # population-level
+
+ggplot(dets_toBI3, aes(x = date)) +
+  geom_point(aes(y = binomial, color = Full.ID), size = 1.5) +
+  geom_line(aes(y = pred), color = "black", linewidth = 1) +
+  scale_x_date(date_labels = "%b %Y") +
+  labs(x = "Date", y = "Probability of location (0/1)", color = "Fish") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+## GLMM
+library(glmmTMB)
+glmm <- glmmTMB(binomial ~ degC + `ft^3/s` + ppt + mslp + (1 | Full.ID),
+              data = dets_toBI3, family = binomial)
+
+
+
+#REDOING AGAIN
+
+flounder.det.clean <- flounder.det.clean %>%
+  mutate(
+    Station   = trimws(Station),
+    System = case_when(
+      is.na(Station) | Station == "" ~ NA_character_,
+      grepl("LT", Station)           ~ "BI",
+      TRUE                           ~ sub("_.*", "", Station)))
+
+flounder.det.clean <- flounder.det.clean %>%
+  mutate(BI = if_else(System == "BI", 1,0))
+
+flounder_toBI <- flounder.det.clean %>%
+  semi_join(ToBI2, by = "Full.ID")
+
+flounder_toBI <- flounder_toBI[, c(4, 10, 22, 37, 40:43)]
+  
+
+flounder_toBI <- flounder_toBI %>% drop_na()
+
+Pasc.flounder <- flounder_toBI |> filter(DRAINAGE %in% c("BACK BAY", "Biloxi", "PASCAGOULA", "Pascagoula"))
+BSL.flounder <- flounder_toBI |> filter(DRAINAGE %in% c("BSL"))
+
+Pasc.flounder <- left_join(Pasc.flounder, Pasc_final, by = c("det.Date" = "date"))
+BSL.flounder <- left_join(BSL.flounder, BSL_final, by = c("det.Date" = "date"))
+
+flounder_toBI <- rbind(Pasc.flounder, BSL.flounder)
+
+flounder_toBI <- flounder_toBI |> select(-n_obs)
+
+flounder_toBI2 <- flounder_toBI |>
+  group_by(Full.ID) |>
+  mutate(first_BI = if (any(System == "BI")) min(det.Date[System == "BI"]) else as.Date(NA)) |>
+  filter(!is.na(first_BI),
+         det.Date >= first_BI - 14,
+         det.Date <= first_BI + 14) |>
+  ungroup()
+
+
+ggplot(flounder_toBI2, aes(x = det.Date, y = BI, color = Full.ID)) +
+  geom_point(size = 1.5) +
+  scale_x_date(date_labels = "%b %Y") +
+  labs(x = "Date", y = "Location", color = "Fish") +
+  theme_bw() +
+  theme(
+    axis.text.y = element_text(size = 6),
+    axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+glmm <- glmmTMB(BI ~ degC + `ft^3/s` + ppt + mslp + (1 | Full.ID),
+              data = flounder_toBI2, family = binomial)
+
+summary(glmm)
+
+```
+
+```{r OLD GLMM CODE}
+####Need to separate the system tranistions based on whether they are moving around BSL or PASC to correlate correct temps 
+
+#Correlating movement times with env times
+system.transitions <- system.transitions %>%
+  mutate(time_hr = floor_date(to_time, unit = "hour"))
+
+PASC_joined <- left_join(system.transitions, PASC_wide, by = c("time_hr" = "time"))
+
+OnlyBI1 <- PASC_joined %>%
+  filter(BI_flag == "1")
+
+mean(OnlyBI1$time_minutes)
+
+mean(OnlyBI1$time_hours)
+
+BI1_24hr <- OnlyBI1 %>%
+  filter(time_hours < 24)
+
+unique(BI1_24hr$Full.ID)
+
+#Run GLMM
+
+PASC_joined <- PASC_joined %>%
+  mutate(t_scaled = scale(degC)[,1],
+         s_scaled  = scale(ppt)[,1])
+
+library(glmmTMB)
+m1 <- glmmTMB(BI_flag ~ t_scaled +  s_scaled + (1 | Full.ID),
+              data = PASC_joined, family = binomial)
+
+library(DHARMa)
+plot(simulateResiduals(m1))          # residual diagnostics
+
+library(performance)
+check_collinearity(m1)               # temp and salinity are often correlated
+
+library(ggeffects)
+ggpredict(m1, terms = c("t_scaled [all]", "s_scaled [-1, 0, 1]")) |> plot()
+
+
+```
+
+
+Objective 2
+```{r}
+
+```
+
+
+Objective 3
+```{r}
+#Quantify Spawning Movements
+  #How many move, how many move multiple times, how many don't move
+#ANOVA comparing three estuaries
+
+#Do populations from each estuary have different behavior? Residency index from each estuary 
+  #Needs to be a weighted residency index because of detection bias
+
+#Things we need 
+  #detection days per individual (Di)
+  #first and last detection
+  #number of monitoring days (Dt) cannot do without receiver info skip for now. use first equation in the RI paper
+  #total number of days the animal was detected (Dd)
+
+#What is our spatial scale
+  #per receiver -> compare the means
+  
+
+#Eliminate the first week of detections for each fish post surgery to remove bias of the surgery
+
+#Need to filter between fish that are actually moving vs not moving
+
+flounder.det.clean <- read_csv("flounder.det.clean.csv")
+
+
+
+
+# =============================================================================
+# Residency Index (RI) for acoustic telemetry data
+# =============================================================================
+# RI = (number of days an animal was detected at a site) /
+#      (total number of days in the monitoring period)
+#
+# Values range 0-1 (1 = detected every day). Three common denominators are
+# offered below; pick the one that matches your question:
+#   "detection_period" : first to last detection of that animal (all sites)
+#   "study_period"     : full deployment window of the array
+#   "custom"           : your own start/end per animal (e.g. tagging date
+#                        to tag battery end)
+# =============================================================================
+
+# ---- Settings -------------------------------------------------------------
+denominator <- "detection_period"   # "detection_period", "study_period", "custom"
+min_detections_per_day <- 1         # raise to 2+ to reduce false-detection influence
+#study_start <- as.Date("2023-01-01")  # used if denominator == "study_period"
+#study_end   <- as.Date("2023-12-31")
+
+# Optional: tag-specific monitoring windows (used if denominator == "custom")
+# tag_windows <- tibble(
+#   tag_id = c("A69-9001-1001", "A69-9001-1002"),
+#   start  = as.Date(c("2023-01-15", "2023-02-01")),
+#   end    = as.Date(c("2023-11-30", "2023-12-31"))
+# )
+
+# command F for Station and switch to System if needed for the remainder of code
+
+#remove all fish that move to barrier island if needed before running (didn't do this, not sure if I was supposed to)
+
+# ---- Clean and add date ---------------------------------------------------
+flounder.ri <- flounder.det.clean %>%
+  mutate(DateTime = as.POSIXct(DateTime, tz = "UTC"),
+         date     = as_date(DateTime)) %>%
+  mutate(Month = month(det.Date, label = TRUE)) %>%
+  filter(!is.na(DateTime), !is.na(Full.ID), !is.na(Station)) %>%
+  distinct(Full.ID, Station, DateTime, .keep_all = TRUE) %>% # drop duplicates
+  mutate(
+    Station   = trimws(Station),
+    System = case_when(
+      is.na(Station) | Station == "" ~ NA_character_,
+      grepl("LT", Station)           ~ "BI",
+      TRUE                           ~ sub("_.*", "", Station)))
+
+# ---- Remove BI and Separate into the Drainage Basins (BSL, Back Bay & Biloxi, Pascagoula)
+flounder.ri <- flounder.ri %>%
+  filter(System != "BI")
+
+flounder.ri.bsl <- flounder.ri %>%
+  filter(DRAINAGE == "BSL")
+
+flounder.ri.bb <- flounder.ri |> filter(DRAINAGE %in% c("BACK BAY", "Biloxi"))
+
+flounder.ri.pasc <- flounder.ri |> filter(DRAINAGE %in% c("PASCAGOULA", "Pascagoula"))
+
+# ---- Separate each drainage into the pre spawn (Aug - Oct), spawn (Nov - Jan), and post spawn (Feb)
+ri.bsl.pre <- flounder.ri.bsl |> filter(Month %in% c("Aug", "Sep", "Oct"))
+
+ri.bsl.spawn <- flounder.ri.bsl |> filter(Month %in% c("Nov", "Dec", "Jan"))
+
+ri.bsl.post <- flounder.ri.bsl |> filter(Month %in% c("Feb"))
+
+ri.bb.pre <- flounder.ri.bb |> filter(Month %in% c("Aug", "Sep", "Oct"))
+
+ri.bb.spawn <- flounder.ri.bb |> filter(Month %in% c("Nov", "Dec", "Jan"))
+
+ri.bb.post <- flounder.ri.bb |> filter(Month %in% c("Feb"))
+
+ri.pasc.pre <- flounder.ri.pasc |> filter(Month %in% c("Aug", "Sep", "Oct"))
+
+ri.pasc.spawn <- flounder.ri.pasc |> filter(Month %in% c("Nov", "Dec", "Jan"))
+
+ri.pasc.post <- flounder.ri.pasc |> filter(Month %in% c("Feb"))
+
+
+# ---- Daily detection summary ---------------------------------------------
+# One row per tag x station x day, keeping days that meet the detection threshold
+daily.bsl.pre <- ri.bsl.pre %>%
+  count(Full.ID, Station, date, name = "n_det") %>%
+  filter(n_det >= min_detections_per_day)
+
+daily.bsl.spawn <- ri.bsl.spawn %>%
+  count(Full.ID, Station, date, name = "n_det") %>%
+  filter(n_det >= min_detections_per_day)
+
+daily.bsl.post <- ri.bsl.post %>%
+  count(Full.ID, Station, date, name = "n_det") %>%
+  filter(n_det >= min_detections_per_day)
+
+daily.bb.pre <- ri.bb.pre %>%
+  count(Full.ID, Station, date, name = "n_det") %>%
+  filter(n_det >= min_detections_per_day)
+
+daily.bb.spawn <- ri.bb.spawn %>%
+  count(Full.ID, Station, date, name = "n_det") %>%
+  filter(n_det >= min_detections_per_day)
+
+daily.bb.post <- ri.bb.post %>%
+  count(Full.ID, Station, date, name = "n_det") %>%
+  filter(n_det >= min_detections_per_day)
+
+daily.pasc.pre <- ri.pasc.pre %>%
+  count(Full.ID, Station, date, name = "n_det") %>%
+  filter(n_det >= min_detections_per_day)
+
+daily.pasc.spawn <- ri.pasc.spawn %>%
+  count(Full.ID, Station, date, name = "n_det") %>%
+  filter(n_det >= min_detections_per_day)
+
+daily.pasc.post <- ri.pasc.post %>%
+  count(Full.ID, Station, date, name = "n_det") %>%
+  filter(n_det >= min_detections_per_day)
+
+# ---- Monitoring period (denominator) per tag -----------------------------
+windows.bsl.pre <- switch(
+  denominator,
+  detection_period = ri.bsl.pre %>%
+    group_by(Full.ID) %>%
+    summarise(start = min(date), end = max(date), .groups = "drop"),
+  study_period = ri.bsl.pre %>%
+    distinct(Full.ID) %>%
+    mutate(start = study_start, end = study_end),
+  custom = tag_windows,
+  stop("denominator must be 'detection_period', 'study_period' or 'custom'")
+) %>%
+  mutate(days_monitored = as.integer(end - start) + 1)
+
+windows.bsl.spawn <- switch(
+  denominator,
+  detection_period = ri.bsl.spawn %>%
+    group_by(Full.ID) %>%
+    summarise(start = min(date), end = max(date), .groups = "drop"),
+  study_period = ri.bsl.spawn %>%
+    distinct(Full.ID) %>%
+    mutate(start = study_start, end = study_end),
+  custom = tag_windows,
+  stop("denominator must be 'detection_period', 'study_period' or 'custom'")
+) %>%
+  mutate(days_monitored = as.integer(end - start) + 1)
+
+windows.bsl.post <- switch(
+  denominator,
+  detection_period = ri.bsl.post %>%
+    group_by(Full.ID) %>%
+    summarise(start = min(date), end = max(date), .groups = "drop"),
+  study_period = ri.bsl.post %>%
+    distinct(Full.ID) %>%
+    mutate(start = study_start, end = study_end),
+  custom = tag_windows,
+  stop("denominator must be 'detection_period', 'study_period' or 'custom'")
+) %>%
+  mutate(days_monitored = as.integer(end - start) + 1)
+
+
+windows.bb.pre <- switch(
+  denominator,
+  detection_period = ri.bb.pre %>%
+    group_by(Full.ID) %>%
+    summarise(start = min(date), end = max(date), .groups = "drop"),
+  study_period = ri.bb.pre %>%
+    distinct(Full.ID) %>%
+    mutate(start = study_start, end = study_end),
+  custom = tag_windows,
+  stop("denominator must be 'detection_period', 'study_period' or 'custom'")
+) %>%
+  mutate(days_monitored = as.integer(end - start) + 1)
+
+windows.bb.spawn <- switch(
+  denominator,
+  detection_period = ri.bb.spawn %>%
+    group_by(Full.ID) %>%
+    summarise(start = min(date), end = max(date), .groups = "drop"),
+  study_period = ri.bb.spawn %>%
+    distinct(Full.ID) %>%
+    mutate(start = study_start, end = study_end),
+  custom = tag_windows,
+  stop("denominator must be 'detection_period', 'study_period' or 'custom'")
+) %>%
+  mutate(days_monitored = as.integer(end - start) + 1)
+
+windows.bb.post <- switch(
+  denominator,
+  detection_period = ri.bb.post %>%
+    group_by(Full.ID) %>%
+    summarise(start = min(date), end = max(date), .groups = "drop"),
+  study_period = ri.bb.post %>%
+    distinct(Full.ID) %>%
+    mutate(start = study_start, end = study_end),
+  custom = tag_windows,
+  stop("denominator must be 'detection_period', 'study_period' or 'custom'")
+) %>%
+  mutate(days_monitored = as.integer(end - start) + 1)
+
+
+windows.pasc.pre <- switch(
+  denominator,
+  detection_period = ri.pasc.pre %>%
+    group_by(Full.ID) %>%
+    summarise(start = min(date), end = max(date), .groups = "drop"),
+  study_period = ri.pasc.pre %>%
+    distinct(Full.ID) %>%
+    mutate(start = study_start, end = study_end),
+  custom = tag_windows,
+  stop("denominator must be 'detection_period', 'study_period' or 'custom'")
+) %>%
+  mutate(days_monitored = as.integer(end - start) + 1)
+
+windows.pasc.spawn <- switch(
+  denominator,
+  detection_period = ri.pasc.spawn %>%
+    group_by(Full.ID) %>%
+    summarise(start = min(date), end = max(date), .groups = "drop"),
+  study_period = ri.pasc.spawn %>%
+    distinct(Full.ID) %>%
+    mutate(start = study_start, end = study_end),
+  custom = tag_windows,
+  stop("denominator must be 'detection_period', 'study_period' or 'custom'")
+) %>%
+  mutate(days_monitored = as.integer(end - start) + 1)
+
+windows.pasc.post <- switch(
+  denominator,
+  detection_period = ri.pasc.post %>%
+    group_by(Full.ID) %>%
+    summarise(start = min(date), end = max(date), .groups = "drop"),
+  study_period = ri.pasc.post %>%
+    distinct(Full.ID) %>%
+    mutate(start = study_start, end = study_end),
+  custom = tag_windows,
+  stop("denominator must be 'detection_period', 'study_period' or 'custom'")
+) %>%
+  mutate(days_monitored = as.integer(end - start) + 1)
+
+# ---- Residency index: per tag x Station ----------------------------------
+ri.bsl.pre.Station <- daily.bsl.pre %>%
+  left_join(windows.bsl.pre, by = "Full.ID") %>%
+  filter(date >= start, date <= end) %>%                # keep days inside window
+  group_by(Full.ID, Station, days_monitored) %>%
+  summarise(days_detected = n_distinct(date), .groups = "drop") %>%
+  mutate(RI = days_detected / days_monitored) %>%
+  # fill in zeros for Station/tag combinations with no detections
+  complete(Full.ID, Station, fill = list(days_detected = 0L, RI = 0)) %>%
+  group_by(Full.ID) %>%
+  mutate(days_monitored = max(days_monitored, na.rm = TRUE)) %>%
+  ungroup() %>%
+  arrange(Full.ID, desc(RI))
+
+ri.bsl.spawn.Station <- daily.bsl.spawn %>%
+  left_join(windows.bsl.spawn, by = "Full.ID") %>%
+  filter(date >= start, date <= end) %>%                # keep days inside window
+  group_by(Full.ID, Station, days_monitored) %>%
+  summarise(days_detected = n_distinct(date), .groups = "drop") %>%
+  mutate(RI = days_detected / days_monitored) %>%
+  # fill in zeros for Station/tag combinations with no detections
+  complete(Full.ID, Station, fill = list(days_detected = 0L, RI = 0)) %>%
+  group_by(Full.ID) %>%
+  mutate(days_monitored = max(days_monitored, na.rm = TRUE)) %>%
+  ungroup() %>%
+  arrange(Full.ID, desc(RI))
+
+ri.bsl.post.Station <- daily.bsl.post %>%
+  left_join(windows.bsl.post, by = "Full.ID") %>%
+  filter(date >= start, date <= end) %>%                # keep days inside window
+  group_by(Full.ID, Station, days_monitored) %>%
+  summarise(days_detected = n_distinct(date), .groups = "drop") %>%
+  mutate(RI = days_detected / days_monitored) %>%
+  # fill in zeros for Station/tag combinations with no detections
+  complete(Full.ID, Station, fill = list(days_detected = 0L, RI = 0)) %>%
+  group_by(Full.ID) %>%
+  mutate(days_monitored = max(days_monitored, na.rm = TRUE)) %>%
+  ungroup() %>%
+  arrange(Full.ID, desc(RI))
+
+
+ri.bb.pre.Station <- daily.bb.pre %>%
+  left_join(windows.bb.pre, by = "Full.ID") %>%
+  filter(date >= start, date <= end) %>%                # keep days inside window
+  group_by(Full.ID, Station, days_monitored) %>%
+  summarise(days_detected = n_distinct(date), .groups = "drop") %>%
+  mutate(RI = days_detected / days_monitored) %>%
+  # fill in zeros for Station/tag combinations with no detections
+  complete(Full.ID, Station, fill = list(days_detected = 0L, RI = 0)) %>%
+  group_by(Full.ID) %>%
+  mutate(days_monitored = max(days_monitored, na.rm = TRUE)) %>%
+  ungroup() %>%
+  arrange(Full.ID, desc(RI))
+
+ri.bb.spawn.Station <- daily.bb.spawn %>%
+  left_join(windows.bb.spawn, by = "Full.ID") %>%
+  filter(date >= start, date <= end) %>%                # keep days inside window
+  group_by(Full.ID, Station, days_monitored) %>%
+  summarise(days_detected = n_distinct(date), .groups = "drop") %>%
+  mutate(RI = days_detected / days_monitored) %>%
+  # fill in zeros for Station/tag combinations with no detections
+  complete(Full.ID, Station, fill = list(days_detected = 0L, RI = 0)) %>%
+  group_by(Full.ID) %>%
+  mutate(days_monitored = max(days_monitored, na.rm = TRUE)) %>%
+  ungroup() %>%
+  arrange(Full.ID, desc(RI))
+
+ri.bb.post.Station <- daily.bb.post %>%
+  left_join(windows.bsl.post, by = "Full.ID") %>%
+  filter(date >= start, date <= end) %>%                # keep days inside window
+  group_by(Full.ID, Station, days_monitored) %>%
+  summarise(days_detected = n_distinct(date), .groups = "drop") %>%
+  mutate(RI = days_detected / days_monitored) %>%
+  # fill in zeros for Station/tag combinations with no detections
+  complete(Full.ID, Station, fill = list(days_detected = 0L, RI = 0)) %>%
+  group_by(Full.ID) %>%
+  mutate(days_monitored = max(days_monitored, na.rm = TRUE)) %>%
+  ungroup() %>%
+  arrange(Full.ID, desc(RI))
+
+
+ri.pasc.pre.Station <- daily.pasc.pre %>%
+  left_join(windows.pasc.pre, by = "Full.ID") %>%
+  filter(date >= start, date <= end) %>%                # keep days inside window
+  group_by(Full.ID, Station, days_monitored) %>%
+  summarise(days_detected = n_distinct(date), .groups = "drop") %>%
+  mutate(RI = days_detected / days_monitored) %>%
+  # fill in zeros for Station/tag combinations with no detections
+  complete(Full.ID, Station, fill = list(days_detected = 0L, RI = 0)) %>%
+  group_by(Full.ID) %>%
+  mutate(days_monitored = max(days_monitored, na.rm = TRUE)) %>%
+  ungroup() %>%
+  arrange(Full.ID, desc(RI))
+
+ri.pasc.spawn.Station <- daily.pasc.spawn %>%
+  left_join(windows.pasc.spawn, by = "Full.ID") %>%
+  filter(date >= start, date <= end) %>%                # keep days inside window
+  group_by(Full.ID, Station, days_monitored) %>%
+  summarise(days_detected = n_distinct(date), .groups = "drop") %>%
+  mutate(RI = days_detected / days_monitored) %>%
+  # fill in zeros for Station/tag combinations with no detections
+  complete(Full.ID, Station, fill = list(days_detected = 0L, RI = 0)) %>%
+  group_by(Full.ID) %>%
+  mutate(days_monitored = max(days_monitored, na.rm = TRUE)) %>%
+  ungroup() %>%
+  arrange(Full.ID, desc(RI))
+
+ri.pasc.post.Station <- daily.pasc.post %>%
+  left_join(windows.pasc.post, by = "Full.ID") %>%
+  filter(date >= start, date <= end) %>%                # keep days inside window
+  group_by(Full.ID, Station, days_monitored) %>%
+  summarise(days_detected = n_distinct(date), .groups = "drop") %>%
+  mutate(RI = days_detected / days_monitored) %>%
+  # fill in zeros for Station/tag combinations with no detections
+  complete(Full.ID, Station, fill = list(days_detected = 0L, RI = 0)) %>%
+  group_by(Full.ID) %>%
+  mutate(days_monitored = max(days_monitored, na.rm = TRUE)) %>%
+  ungroup() %>%
+  arrange(Full.ID, desc(RI))
+
+# ---- Residency index: per tag (all Stations combined) --------------------
+ri.bsl.pre.overall <- daily.bsl.pre %>%
+  left_join(windows.bsl.pre, by = "Full.ID") %>%
+  filter(date >= start, date <= end) %>%
+  group_by(Full.ID, days_monitored) %>%
+  summarise(days_detected = n_distinct(date), .groups = "drop") %>%
+  mutate(RI_overall = days_detected / days_monitored)
+
+ri.bsl.spawn.overall <- daily.bsl.spawn %>%
+  left_join(windows.bsl.spawn, by = "Full.ID") %>%
+  filter(date >= start, date <= end) %>%
+  group_by(Full.ID, days_monitored) %>%
+  summarise(days_detected = n_distinct(date), .groups = "drop") %>%
+  mutate(RI_overall = days_detected / days_monitored)
+
+ri.bsl.post.overall <- daily.bsl.post %>%
+  left_join(windows.bsl.post, by = "Full.ID") %>%
+  filter(date >= start, date <= end) %>%
+  group_by(Full.ID, days_monitored) %>%
+  summarise(days_detected = n_distinct(date), .groups = "drop") %>%
+  mutate(RI_overall = days_detected / days_monitored)
+
+
+ri.bb.pre.overall <- daily.bb.pre %>%
+  left_join(windows.bb.pre, by = "Full.ID") %>%
+  filter(date >= start, date <= end) %>%
+  group_by(Full.ID, days_monitored) %>%
+  summarise(days_detected = n_distinct(date), .groups = "drop") %>%
+  mutate(RI_overall = days_detected / days_monitored)
+
+ri.bb.spawn.overall <- daily.bb.spawn %>%
+  left_join(windows.bb.spawn, by = "Full.ID") %>%
+  filter(date >= start, date <= end) %>%
+  group_by(Full.ID, days_monitored) %>%
+  summarise(days_detected = n_distinct(date), .groups = "drop") %>%
+  mutate(RI_overall = days_detected / days_monitored)
+
+ri.bb.post.overall <- daily.bb.post %>%
+  left_join(windows.bb.post, by = "Full.ID") %>%
+  filter(date >= start, date <= end) %>%
+  group_by(Full.ID, days_monitored) %>%
+  summarise(days_detected = n_distinct(date), .groups = "drop") %>%
+  mutate(RI_overall = days_detected / days_monitored)
+
+
+ri.pasc.pre.overall <- daily.pasc.pre %>%
+  left_join(windows.pasc.pre, by = "Full.ID") %>%
+  filter(date >= start, date <= end) %>%
+  group_by(Full.ID, days_monitored) %>%
+  summarise(days_detected = n_distinct(date), .groups = "drop") %>%
+  mutate(RI_overall = days_detected / days_monitored)
+
+ri.pasc.spawn.overall <- daily.pasc.spawn %>%
+  left_join(windows.pasc.spawn, by = "Full.ID") %>%
+  filter(date >= start, date <= end) %>%
+  group_by(Full.ID, days_monitored) %>%
+  summarise(days_detected = n_distinct(date), .groups = "drop") %>%
+  mutate(RI_overall = days_detected / days_monitored)
+
+ri.pasc.post.overall <- daily.pasc.post %>%
+  left_join(windows.pasc.post, by = "Full.ID") %>%
+  filter(date >= start, date <= end) %>%
+  group_by(Full.ID, days_monitored) %>%
+  summarise(days_detected = n_distinct(date), .groups = "drop") %>%
+  mutate(RI_overall = days_detected / days_monitored)
+
+
+# ---- Residency index by month (tag x Station x month) --------------------
+ri_monthly <- daily %>%
+  mutate(month = floor_date(date, "month")) %>%
+  group_by(Full.ID, Station, month) %>%
+  summarise(days_detected = n_distinct(date), .groups = "drop") %>%
+  mutate(days_in_month = days_in_month(month),
+         RI_month = days_detected / days_in_month)
+
+# ---- Population summary by Station ---------------------------------------
+ri.bsl.pre.summary <- ri.bsl.pre.Station %>%
+  group_by(Station) %>%
+  summarise(n_tags  = n_distinct(Full.ID),
+            mean_RI = mean(RI),
+            sd_RI   = sd(RI),
+            min_RI  = min(RI),
+            max_RI  = max(RI),
+            .groups = "drop")
+
+ri.bsl.spawn.summary <- ri.bsl.spawn.Station %>%
+  group_by(Station) %>%
+  summarise(n_tags  = n_distinct(Full.ID),
+            mean_RI = mean(RI),
+            sd_RI   = sd(RI),
+            min_RI  = min(RI),
+            max_RI  = max(RI),
+            .groups = "drop")
+
+ri.bsl.post.summary <- ri.bsl.post.Station %>%
+  group_by(Station) %>%
+  summarise(n_tags  = n_distinct(Full.ID),
+            mean_RI = mean(RI),
+            sd_RI   = sd(RI),
+            min_RI  = min(RI),
+            max_RI  = max(RI),
+            .groups = "drop")
+
+
+ri.bb.pre.summary <- ri.bb.pre.Station %>%
+  group_by(Station) %>%
+  summarise(n_tags  = n_distinct(Full.ID),
+            mean_RI = mean(RI),
+            sd_RI   = sd(RI),
+            min_RI  = min(RI),
+            max_RI  = max(RI),
+            .groups = "drop")
+
+ri.bb.spawn.summary <- ri.bb.spawn.Station %>%
+  group_by(Station) %>%
+  summarise(n_tags  = n_distinct(Full.ID),
+            mean_RI = mean(RI),
+            sd_RI   = sd(RI),
+            min_RI  = min(RI),
+            max_RI  = max(RI),
+            .groups = "drop")
+
+ri.bb.post.summary <- ri.bb.post.Station %>%
+  group_by(Station) %>%
+  summarise(n_tags  = n_distinct(Full.ID),
+            mean_RI = mean(RI),
+            sd_RI   = sd(RI),
+            min_RI  = min(RI),
+            max_RI  = max(RI),
+            .groups = "drop")
+
+
+ri.pasc.pre.summary <- ri.pasc.pre.Station %>%
+  group_by(Station) %>%
+  summarise(n_tags  = n_distinct(Full.ID),
+            mean_RI = mean(RI),
+            sd_RI   = sd(RI),
+            min_RI  = min(RI),
+            max_RI  = max(RI),
+            .groups = "drop")
+
+ri.pasc.spawn.summary <- ri.pasc.spawn.Station %>%
+  group_by(Station) %>%
+  summarise(n_tags  = n_distinct(Full.ID),
+            mean_RI = mean(RI),
+            sd_RI   = sd(RI),
+            min_RI  = min(RI),
+            max_RI  = max(RI),
+            .groups = "drop")
+
+ri.pasc.post.summary <- ri.pasc.post.Station %>%
+  group_by(Station) %>%
+  summarise(n_tags  = n_distinct(Full.ID),
+            mean_RI = mean(RI),
+            sd_RI   = sd(RI),
+            min_RI  = min(RI),
+            max_RI  = max(RI),
+            .groups = "drop")
+
+# ---- Plots ---------------------------------------------------------------
+# (a) Heatmap of RI per tag and Station
+p_heat <- ggplot(ri_Station, aes(Station, Full.ID, fill = RI)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%.2f", RI)), size = 3) +
+  scale_fill_viridis_c(limits = c(0, 1), option = "C") +
+  labs(x = "Station", y = "Tag ID", fill = "RI",
+       title = "Residency index by individual and Station") +
+  theme_minimal()
+
+# (b) Boxplot of RI by Station
+p_box <- ggplot(ri_Station, aes(Station, RI)) +
+  geom_boxplot(outlier.shape = NA, fill = "grey85") +
+  geom_jitter(width = 0.15, alpha = 0.7) +
+  ylim(0, 1) +
+  labs(x = "Station", y = "Residency index",
+       title = "Residency index distribution by Station") +
+  theme_minimal()
+
+# (c) Monthly RI through time
+p_month <- ggplot(ri_monthly, aes(month, RI_month, colour = Station, group = Station)) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1) +
+  stat_summary(fun = mean, geom = "point") +
+  ylim(0, 1) +
+  labs(x = NULL, y = "Mean monthly RI", colour = "Station",
+       title = "Mean monthly residency index") +
+  theme_minimal()
+
+print(p_heat); print(p_box); print(p_month)
+
+# ---- Export --------------------------------------------------------------
+# write_csv(ri_station, "residency_index_by_station.csv")
+# write_csv(ri_overall, "residency_index_overall.csv")
+# write_csv(ri_monthly, "residency_index_monthly.csv")
+# ggsave("ri_heatmap.png", p_heat, width = 8, height = 5, dpi = 300)
+
+
+# ---- ANOVA ---------------------------------------------------------------
+
+#Filter fish detected for less than 10 days 
+
+ri_Station_clean <- ri_Station_clean %>%
+  filter(days_monitored > 9)
+
+ri_Station_all <- ri_Station %>%  #Keeps barrier island RI values
+  filter(days_monitored > 9)
+
+anova <- aov(RI ~ Station, data = ri_Station_all)
+anova <- aov(RI ~ System, data = ri_Station_all)
+anova <- aov(RI ~ System, data = ri_Station_clean)
+
+summary(anova)
+
+tukey <- TukeyHSD(anova, conf.level = 0.95)
+print(tukey)
+
+#Calculate start and stop times for in spawning season and out of spawning season
+    #pre spawn, spawn, post spawn (ignore the summer)
+#ignore barrier island locations
+#allows you to see if RI drops 
+#in order to deal with different spatial coverage only look at the fish tagged in BSL for calculating RI in BSL (same for back bay, pasc)
+  #Use DRAINAGE to Sort them out after dropping BI
+#Do it based on month (dropping the year so that fish tagged in different years doesnt matter)
+
+# ---- Box and Whisker -----
+#Add pre, spawn, post column to each data frame
+ri.bsl.pre.overall$time <- "pre"
+ri.bsl.spawn.overall$time <- "spawn"
+ri.bsl.post.overall$time <- "post"
+
+ri.bb.pre.overall$time <- "pre"
+ri.bb.spawn.overall$time <- "spawn"
+ri.bb.post.overall$time <- "post"
+
+ri.pasc.pre.overall$time <- "pre"
+ri.pasc.spawn.overall$time <- "spawn"
+ri.pasc.post.overall$time <- "post"
+
+#Combine the .overall dataframes for each estuary
+ri.bsl.overall <- rbind(ri.bsl.pre.overall, ri.bsl.spawn.overall, ri.bsl.post.overall)
+
+ri.bb.overall <- rbind(ri.bb.pre.overall, ri.bb.spawn.overall, ri.bb.post.overall)
+
+ri.pasc.overall <- rbind(ri.pasc.pre.overall, ri.pasc.spawn.overall, ri.pasc.post.overall)
+
+#Drop all fish monitored less than 5 days & change the levels
+ri.bsl.overall <- ri.bsl.overall %>%
+  filter(days_monitored >4)
+
+ri.bsl.overall <- ri.bsl.overall |> 
+  mutate(time = factor(time, levels = c("pre", "spawn", "post")))
+
+ri.bb.overall <- ri.bb.overall %>%
+  filter(days_monitored >4)
+
+ri.bb.overall <- ri.bb.overall |> 
+  mutate(time = factor(time, levels = c("pre", "spawn", "post")))
+
+ri.pasc.overall <- ri.pasc.overall %>%
+  filter(days_monitored >4)
+
+ri.pasc.overall <- ri.pasc.overall |> 
+  mutate(time = factor(time, levels = c("pre", "spawn", "post")))
+
+#box and whisker for each estuary across timeframe
+
+ggplot(ri.bsl.overall, aes(x = time, y = RI_overall)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.6, outlier.color = "red") +
+  labs(title = "BSL RI",
+       x = "Time Period",
+       y = "RI") +
+  theme_minimal()
+
+ggplot(ri.bb.overall, aes(x = time, y = RI_overall)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.6, outlier.color = "red") +
+  labs(title = "BB RI",
+       x = "Time Period",
+       y = "RI") +
+  theme_minimal()
+
+ggplot(ri.pasc.overall, aes(x = time, y = RI_overall)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.6, outlier.color = "red") +
+  labs(title = "Pasc RI",
+       x = "Time Period",
+       y = "RI") +
+  theme_minimal()
+
+#Mean Plots
+ri.bsl.summary <- ri.bsl.overall |>
+  group_by(time) |>
+  summarise(mean_ri = mean(RI_overall, na.rm = TRUE),
+            sd_ri = sd(RI_overall, na.rm = TRUE))
+
+ri.bb.summary <- ri.bb.overall |>
+  group_by(time) |>
+  summarise(mean_ri = mean(RI_overall, na.rm = TRUE),
+            sd_ri = sd(RI_overall, na.rm = TRUE))
+
+ri.pasc.summary <- ri.pasc.overall |>
+  group_by(time) |>
+  summarise(mean_ri = mean(RI_overall, na.rm = TRUE),
+            sd_ri = sd(RI_overall, na.rm = TRUE))
+
+ggplot(ri.bsl.summary, aes(x = time, y = mean_ri, fill = time)) +
+  geom_col(alpha = 0.7) +
+  geom_errorbar(aes(ymin = mean_ri - sd_ri,
+                    ymax = mean_ri + sd_ri),
+                width = 0.2) +
+  scale_fill_manual(values = c("pre" = "#F1495B",
+                               "spawn" = "#FFCE1B",
+                               "post" = "steelblue")) +
+  labs(title = "BSL Mean RI",
+       x = "Time Period",
+       y = "RI") +
+  theme_minimal()
+
+ggplot(ri.bb.summary, aes(x = time, y = mean_ri, fill = time)) +
+  geom_col(alpha = 0.7) +
+  geom_errorbar(aes(ymin = mean_ri - sd_ri,
+                    ymax = mean_ri + sd_ri),
+                width = 0.2) +
+  scale_fill_manual(values = c("pre" = "#F1495B",
+                               "spawn" = "#FFCE1B",
+                               "post" = "steelblue")) +
+  labs(title = "BB Mean RI",
+       x = "Time Period",
+       y = "RI") +
+  theme_minimal()
+
+ggplot(ri.pasc.summary, aes(x = time, y = mean_ri, fill = time)) +
+  geom_col(alpha = 0.7) +
+  geom_errorbar(aes(ymin = mean_ri - sd_ri,
+                    ymax = mean_ri + sd_ri),
+                width = 0.2) +
+  scale_fill_manual(values = c("pre" = "#F1495B",
+                               "spawn" = "#FFCE1B",
+                               "post" = "steelblue")) +
+  labs(title = "Pasc Mean RI",
+       x = "Time Period",
+       y = "RI") +
+  theme_minimal()
+
+##mean plots but using the Station files, includes the receiver / fish combinations with no detections
+  #I dont think this is correct
+#Add pre, spawn, post column to each data frame
+ri.bsl.pre.Station$time <- "pre"
+ri.bsl.spawn.Station$time <- "spawn"
+ri.bsl.post.Station$time <- "post"
+
+ri.bb.pre.Station$time <- "pre"
+ri.bb.spawn.Station$time <- "spawn"
+ri.bb.post.Station$time <- "post"
+
+ri.pasc.pre.Station$time <- "pre"
+ri.pasc.spawn.Station$time <- "spawn"
+ri.pasc.post.Station$time <- "post"
+
+#Combine the .overall dataframes for each estuary
+ri.bsl.Station <- rbind(ri.bsl.pre.Station, ri.bsl.spawn.Station, ri.bsl.post.Station)
+
+ri.bb.Station <- rbind(ri.bb.pre.Station, ri.bb.spawn.Station, ri.bb.post.Station)
+
+ri.pasc.Station <- rbind(ri.pasc.pre.Station, ri.pasc.spawn.Station, ri.pasc.post.Station)
+
+ri.bsl.summary2 <- ri.bsl.Station |>
+  group_by(time) |>
+  summarise(mean_ri = mean(RI, na.rm = TRUE),
+            sd_ri = sd(RI, na.rm = TRUE))
+
+ri.bb.summary2 <- ri.bb.Station |>
+  group_by(time) |>
+  summarise(mean_ri = mean(RI, na.rm = TRUE),
+            sd_ri = sd(RI, na.rm = TRUE))
+
+ri.pasc.summary2 <- ri.pasc.Station |>
+  group_by(time) |>
+  summarise(mean_ri = mean(RI, na.rm = TRUE),
+            sd_ri = sd(RI, na.rm = TRUE))
+
+
+#plots
+
+ggplot(ri.bsl.summary2, aes(x = time, y = mean_ri, fill = time)) +
+  geom_col(alpha = 0.7) +
+  geom_errorbar(aes(ymin = mean_ri - sd_ri,
+                    ymax = mean_ri + sd_ri),
+                width = 0.2) +
+  scale_fill_manual(values = c("pre" = "#F1495B",
+                               "spawn" = "#FFCE1B",
+                               "post" = "steelblue")) +
+  labs(title = "BSL Mean RI",
+       x = "Time Period",
+       y = "RI") +
+  theme_minimal()
+
+ggplot(ri.bb.summary2, aes(x = time, y = mean_ri, fill = time)) +
+  geom_col(alpha = 0.7) +
+  geom_errorbar(aes(ymin = mean_ri - sd_ri,
+                    ymax = mean_ri + sd_ri),
+                width = 0.2) +
+  scale_fill_manual(values = c("pre" = "#F1495B",
+                               "spawn" = "#FFCE1B",
+                               "post" = "steelblue")) +
+  labs(title = "BB Mean RI",
+       x = "Time Period",
+       y = "RI") +
+  theme_minimal()
+
+ggplot(ri.pasc.summary2, aes(x = time, y = mean_ri, fill = time)) +
+  geom_col(alpha = 0.7) +
+  geom_errorbar(aes(ymin = mean_ri - sd_ri,
+                    ymax = mean_ri + sd_ri),
+                width = 0.2) +
+  scale_fill_manual(values = c("pre" = "#F1495B",
+                               "spawn" = "#FFCE1B",
+                               "post" = "steelblue")) +
+  labs(title = "Pasc Mean RI",
+       x = "Time Period",
+       y = "RI") +
+  theme_minimal()
+
+```
+
+
+Objective 4
+```{r}
+
+```
+
+
+GITHUB
+```{r}
+library(usethis)
+library(gitcreds)
+use_git_config(user.name = "ethanmocny", user.email = "ethanmocny@gmail.com")
+
+create_github_token()
+gitcreds::gitcreds_set()
+
+# Initialize Git in your current local project (if not already done)
+usethis::use_git()
+
+# Create a new repository on GitHub and push your local files to it
+usethis::use_github()
+
+# 1. Initialize git in the current project folder
+use_git()
+
+# 2. Point it at your existing GitHub repo
+use_git_remote("origin", "https://github.com/epantel/Flounder-Project.git")
+
+# 3. Check that it worked
+git_remotes()
+
+```
+
