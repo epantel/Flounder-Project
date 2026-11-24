@@ -1,0 +1,913 @@
+---
+title: "Southern Flounder Acoustic Telemetry: Data Cleaning and Environmental Drivers of Movement"
+author: "Tania Sultana"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = TRUE, message = FALSE)
+```
+
+# Introduction
+The detection and tag metadata cleaning steps below build on the shared
+script our group is using (originally written by Evelyn, and the version
+the class agreed was the most reliable treatment for Objective 1), with
+a few fixes I found while running it: a duplicate tag ID problem that was
+inflating the detection data, a regex typo, and a broken pipe operator.
+The environmental data section builds on the USGS data pull that Ethan,
+Abigail, and David put together and shared with the group, extended here
+with air pressure data from `pressuredat.csv` and a system-by-system
+join, to answer our first class objective: what environmental conditions
+are associated with flounder moving offshore toward the barrier islands.
+
+The four class objectives, as finalized by Dr. Andres from everyone's combined
+introductions, are:
+
+1. Identify the environmental factors (temperature, salinity, discharge,
+   pressure, day length) associated with offshore movement, using a GLMM or GAMM.
+2. Describe connectivity of fish movement across estuaries and barrier islands.
+3. Quantify the ratio of migratory versus resident individuals in each estuary.
+4. Estimate survival over the course of the tagging study using Kaplan-Meier curves.
+
+
+```{r libraries}
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(ggplot2)
+library(dataRetrieval)
+```
+
+# Step 1: Load the Raw Data
+
+
+```{r working-directory}
+
+setwd("C:/Biometry Class assignment/HW1/Flounder")
+
+flounder.det <- read.csv("Flounder_dets.csv")
+flounder.tagspec <- read.csv("Flounder_Tag_Meta_Combined.csv")
+```
+
+# Step 2: Clean the Tag Metadata and Fix the Duplicate ID Problem
+
+```{r tagspec-cleaning}
+flounder.tagspec <- flounder.tagspec %>%
+  mutate(
+    Tag.DateTime = mdy(DATE_TAGGED),
+    Tag.Date = as.Date(Tag.DateTime),
+    Full.ID = TRANSMITTER
+  )
+```
+
+Before joining this to the detection data, it's worth checking whether any
+transmitter ID appears more than once. If it does, a join will multiply rows
+for every fish that shares that duplicated ID, which is exactly what happened
+when I first ran this: the detection table grew by about 59,000 extra rows.
+
+```{r check-duplicates}
+# flounder.tagspec <- flounder.tagspec %>%
+#   arrange(Full.ID, desc(Date)) %>%
+#   distinct(Full.ID, .keep_all = TRUE)
+
+dup.check <- flounder.tagspec %>%
+  count(Full.ID) %>%
+  filter(n > 1)
+
+dup.check
+
+#flounder.tagspec %>%
+# filter(Full.ID %in% dup.check$Full.ID) %>%
+#  arrange(Full.ID, DATE_TAGGED) %>%
+#  select(Full.ID, DATE_TAGGED, EST_TAG_LIFE, CAPTURE_SITE, RECAPTURE_DATE, RECAPTURE_NOTES)
+
+packageVersion("dplyr")
+```
+
+
+
+```{r remove-duplicates}
+#flounder.tagspec <- flounder.tagspec %>%
+#  arrange(Full.ID, desc(Date)) %>%
+#  distinct(Full.ID, .keep_all = TRUE)
+
+# Confirm the fix worked: this should now return zero rows.
+#flounder.tagspec %>%
+#  count(Full.ID) %>%
+#  filter(n > 1)
+```
+
+# Step 3: Join Detections to Tag Metadata
+
+```{r join-detections}
+flounder.det <- flounder.det %>%
+  mutate(DateTime = ymd_hms(Time..UTC., tz = "UTC"))
+
+flounder.det2 <- left_join(
+  flounder.det, flounder.tagspec,
+  by = join_by(Full.ID, closest(DateTime >= Tag.DateTime))
+)
+
+flounder.det2 <- flounder.det2 %>%
+  mutate(
+    Est.Tag.Death = Tag.Date + EST_TAG_LIFE
+  )
+
+nrow(flounder.det)
+nrow(flounder.det2)
+```
+
+`Est.Tag.Death` is an estimate of when each tag's battery would have run out,
+based on the manufacturer's estimated tag life. Any detection recorded after
+that date for a given fish is almost certainly not a real, living fish
+anymore, and needs to be flagged.
+
+# Step 4: Flag and Remove Post-Mortem and False Detections
+
+```{r parse-datetime}
+flounder.det2 <- flounder.det2 %>%
+  mutate(det.Date = as.Date(DateTime))
+```
+
+```{r last-detection}
+last.det <- flounder.det2 %>%
+  group_by(Full.ID) %>%
+  summarise(last.det = max(DateTime, na.rm = TRUE))
+```
+
+```{r post-death-summary}
+post.death.summary <- flounder.det2 %>%
+  filter(DateTime > Est.Tag.Death) %>%
+  group_by(Full.ID, Est.Tag.Death) %>%
+  summarise(
+    n.post.death.det = n(),
+    first.post.death.det = min(DateTime, na.rm = TRUE),
+    last.post.death.det = max(DateTime, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+post.death.summary
+```
+
+Use `post.death.summary` to decide, fish by fish, whether a cutoff date is needed. Some fish may show a handful of detections right after the estimated tag-death date that are plausible (estimated tag life is an estimate, not an exact date), while others show detections continuing for months afterward, which usually means the tag washed up somewhere or was eaten by something that kept moving. Add a filter line for each fish that needs one, following this pattern:
+
+```{r manual-cutoffs}
+# Example of a manually identified false-detection cutoff.
+# fake1 <- subset(flounder.det2, Full.ID == "A69-1602-60671")
+# Any detection after 11/2021 for this fish is probably fake.
+
+fish.cutoffs <- flounder.det2 %>%
+  distinct(Full.ID, Est.Tag.Death) %>%
+  left_join(post.death.summary, by = c("Full.ID", "Est.Tag.Death")) %>%
+  mutate(
+    keep.through = case_when(
+      is.na(n.post.death.det) ~ Est.Tag.Death,
+      n.post.death.det > 5 ~ last.post.death.det,
+      TRUE ~ Est.Tag.Death
+    )
+  ) %>%
+  select(Full.ID, Est.Tag.Death, keep.through)
+
+flounder.det3 <- flounder.det2 %>%
+  left_join(fish.cutoffs, by = c("Full.ID", "Est.Tag.Death")) %>%
+  filter(DateTime <= keep.through) %>%
+  select(-keep.through)
+
+nrow(flounder.det2)
+nrow(flounder.det3)
+```
+
+# Step 5: Check for Simultaneous Detections at Different Stations
+
+A fish cannot be detected at two different receiver stations at the same moment. If that shows up in the data, it usually means a detection was misread or the receiver clock drifted, and those records need a closer look.
+
+```{r simultaneous-detections}
+simultaneous.det <- flounder.det3 %>%
+  arrange(Full.ID, DateTime) %>%
+  group_by(Full.ID) %>%
+  mutate(
+    next.time = lead(DateTime),
+    next.station = lead(Station),
+    gap.minutes = as.numeric(difftime(next.time, DateTime, units = "mins"))
+  ) %>%
+  ungroup()
+
+simultaneous.det2 <- simultaneous.det %>%
+  filter(!is.na(gap.minutes), gap.minutes <= 3, Station != next.station)
+
+# Note: the system prefix before the station code needs to come off before
+# comparing stations (e.g. "BSL_01" and "BSL_02" are different stations in the
+# same system). The correct way to strip everything from the first
+# underscore onward is sub("_.*", "", x) -- a plain sub("_*", "", x) is a
+# no-op and will not actually remove anything, since it only matches an
+# empty string.
+simultaneous.det3 <- simultaneous.det2 %>%
+  mutate(
+    station.system = sub("_.*", "", Station),
+    next.station.system = sub("_.*", "", next.station)
+  ) %>%
+  filter(station.system == next.station.system)
+
+simultaneous.det3
+simultaneous.det3 %>%
+  count(Station, next.station, sort = TRUE) %>%
+  head(20)
+```
+
+Review `simultaneous.det3` and remove any fish/time combinations that look
+like clock-drift artifacts rather than genuine double detections, using the
+same filtering pattern as Step 4.
+
+```{r final-clean-detections}
+kept.fish <- flounder.tagspec %>%
+  filter(toupper(trimws(RELEASED)) %in% c("N", "NO")) %>%
+  mutate(Recapture.Date = mdy(RECAPTURE_DATE)) %>%
+  select(Full.ID, Recapture.Date)
+
+flounder.det.clean <- flounder.det3 %>%
+  left_join(kept.fish, by = "Full.ID") %>%
+  filter(is.na(Recapture.Date) | DateTime <= Recapture.Date) %>%
+  select(-Recapture.Date)
+
+
+nrow(flounder.det3)
+nrow(flounder.det.clean)
+
+flounder.tagspec %>%
+  filter(toupper(trimws(RELEASED)) %in% c("N", "NO")) %>%
+  select(Full.ID, RECAPTURE_DATE)
+```
+
+
+# Step 6: Estuary System Transitions (Objectives 2 and 3)
+
+This builds a table of every time a fish moved from one estuary system to
+another, which is the input both for the connectivity description in
+Objective 2 and for the environmental model in this file.
+
+```{r system-transitions}
+# Assign each detection to a system, with fish haven and LPT stations
+# reclassified as barrier island, and drop the handful of detections with
+# a blank station name.
+flounder.det.clean <- flounder.det.clean %>%
+  mutate(
+    system = case_when(
+      grepl("_FH_", Station) ~ "BI",
+      grepl("^MSS_PASC_LT_", Station) ~ "BI",
+      TRUE ~ sub("_.*", "", Station)
+    )
+  ) %>%
+  filter(Station != "")
+
+# Flatten detections to one system per fish per day. When a fish was
+# detected in more than one system on the same day (like the Pascagoula
+# PR/PRE overlap Mike flagged), use whichever system it was detected in
+# most that day.
+daily.system <- flounder.det.clean %>%
+  count(Full.ID, det.Date, system, name = "n.det") %>%
+  arrange(Full.ID, det.Date, desc(n.det)) %>%
+  group_by(Full.ID, det.Date) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(Full.ID, det.Date, system)
+
+# Build transitions off the flattened daily table, and only keep a
+# transition if the fish was seen in the new system within 3 days of
+# last being seen in the old one.
+system.transitions <- daily.system %>%
+  arrange(Full.ID, det.Date) %>%
+  group_by(Full.ID) %>%
+  mutate(
+    from_system = lag(system),
+    from_date = lag(det.Date),
+    to_system = system,
+    to_date = det.Date
+  ) %>%
+  filter(!is.na(from_system), from_system != to_system) %>%
+  mutate(gap_days = as.numeric(to_date - from_date)) %>%
+  filter(gap_days <= 3) %>%
+  select(Full.ID, from_system, from_date, to_system, to_date, gap_days) %>%
+  ungroup()
+```
+
+Fish with zero rows in `system.transitions` never left their original estuary
+system. That list is useful on its own, for Objective 3's resident-versus-
+migratory classification.
+
+```{r resident-fish}
+movin.flounda2 <- flounder.det.clean %>%
+  distinct(Full.ID) %>%
+  filter(!(Full.ID %in% system.transitions$Full.ID))
+
+movin.flounda2
+```
+
+# Step 7: Station Locations for Mapping
+
+```{r station-locations}
+station.locations <- flounder.det.clean %>%
+  distinct(Station, Latitude, Longitude)
+
+# write.csv(station.locations, "station.locations.csv", row.names = FALSE)
+```
+
+If group's `stations.csv` file (built separately in ArcMap, with a
+`RecGroup` column assigning each station to a broader region) is available,
+join it in here so the transitions table has a coarser regional grouping in
+addition to the per-station detail:
+
+```{r join-recgroup}
+# stations <- read.csv("stations.csv")
+# flounder.det.clean <- left_join(flounder.det.clean, stations, by = "Station")
+```
+
+# Step 8: Environmental Data (Objective 1)
+
+This section pulls real water-monitoring data from USGS for the stations
+nearest our fish, converts everything to consistent units, and lines it up in
+time with the fish movement data so it can be used as a predictor.
+
+```{r env-libraries}
+library(dataRetrieval)
+```
+
+```{r env-stations}
+# dataRetrieval's newer read_waterdata_continuous() isn't in the CRAN
+# version installed (2.7.18), so this uses the older, stable readNWISuv()
+# instead. Site numbers drop the "USGS-" prefix for this function.
+# GPTL (Mississippi Sound at Gulfport Light) was pulled in an earlier draft
+# but never actually used downstream, so it's left out here.
+
+MSB <- readNWISuv(
+  siteNumbers = "301429089145600",
+  parameterCd = c("00010", "00095"),
+  startDate = "2021-08-01", endDate = "2024-03-31", tz = "UTC"
+)
+
+RIL <- readNWISuv(
+  siteNumbers = "301849088350000",
+  parameterCd = c("00010", "00095"),
+  startDate = "2021-08-01", endDate = "2024-03-31", tz = "UTC"
+)
+
+PRL <- readNWISuv(
+  siteNumbers = "02489500",
+  parameterCd = c("00060"),
+  startDate = "2021-08-01", endDate = "2024-03-31", tz = "UTC"
+)
+
+PAS <- readNWISuv(
+  siteNumbers = "02479310",
+  parameterCd = c("00060"),
+  startDate = "2021-08-01", endDate = "2024-03-31", tz = "UTC"
+)
+```
+
+Some stations report salinity directly in ppt; others only report specific
+conductance in uS/cm. This converts conductance to an estimated salinity, and
+gives the temperature column a clear name, before combining stations.
+
+```{r unit-conversion}
+convert.conductance <- function(df) {
+  df %>%
+    mutate(
+      temp_C = X_00010_00000,
+      salinity_ppt = X_00095_00000 * 0.64 / 1000
+    )
+}
+
+RIL <- convert.conductance(RIL)
+MSB <- convert.conductance(MSB)
+```
+
+```{r reshape-environmental-data}
+PASC_env <- RIL %>% select(time = dateTime, temp_C, salinity_ppt)
+BSL_env  <- MSB %>% select(time = dateTime, temp_C, salinity_ppt)
+```
+
+# Step 8b: Add Air Pressure Data
+
+Air pressure is one of the five factors Dr. Andres asked us to include, and
+it comes from a different file than the water data. `pressuredat.csv` has
+hourly air pressure (`mslp`, mean sea-level pressure) from two airport
+weather stations: GPT (Gulfport) and BIX (Biloxi/Keesler).
+
+```{r load-pressure}
+pressure.dat <- read.csv("pressuredat.csv", header = TRUE)
+
+pressure.dat <- pressure.dat %>%
+  mutate(
+    time = ymd_hm(valid, tz = "UTC"),
+    time_hr = floor_date(time, unit = "hour"),
+    mslp = as.numeric(mslp)
+  )
+
+pressure.wide <- pressure.dat %>%
+  group_by(station, time_hr) %>%
+  summarise(mslp = mean(mslp, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(id_cols = time_hr, names_from = station, values_from = mslp)
+```
+
+# GPT = Biloxi/St. Louis Bay side, BIX = further east, Pascagoula side.
+# This is my guess based on geography, not confirmed from station metadata yet.
+
+```{r daily-environmental-summaries}
+
+safe.range <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_real_)
+  diff(base::range(x))
+}
+
+daily.summary <- function(df, value_col, date_col = "time") {
+  df %>%
+    mutate(date = as.Date(.data[[date_col]])) %>%
+    group_by(date) %>%
+    summarise(
+      mean = mean(.data[[value_col]], na.rm = TRUE),
+      sd = sd(.data[[value_col]], na.rm = TRUE),
+      se = sd(.data[[value_col]], na.rm = TRUE) / sqrt(sum(!is.na(.data[[value_col]]))),
+      range = safe.range(.data[[value_col]]),
+      .groups = "drop"
+    )
+}
+
+PASC.temp.daily <- daily.summary(PASC_env, "temp_C") %>% rename_with(~ paste0("temp_", .), -date)
+PASC.sal.daily  <- daily.summary(PASC_env, "salinity_ppt") %>% rename_with(~ paste0("sal_", .), -date)
+BSL.temp.daily  <- daily.summary(BSL_env, "temp_C") %>% rename_with(~ paste0("temp_", .), -date)
+BSL.sal.daily   <- daily.summary(BSL_env, "salinity_ppt") %>% rename_with(~ paste0("sal_", .), -date)
+
+PASC.env.daily <- PASC.temp.daily %>% full_join(PASC.sal.daily, by = "date")
+BSL.env.daily  <- BSL.temp.daily %>% full_join(BSL.sal.daily, by = "date")
+
+pressure.daily <- pressure.dat %>%
+  mutate(date = as.Date(time)) %>%
+  group_by(station, date) %>%
+  summarise(
+    mean = mean(mslp, na.rm = TRUE),
+    sd = sd(mslp, na.rm = TRUE),
+    se = sd(mslp, na.rm = TRUE) / sqrt(sum(!is.na(mslp))),
+   range = safe.range(mslp),
+    .groups = "drop"
+  )
+
+pressure.daily.wide <- pressure.daily %>%
+  pivot_wider(id_cols = date, names_from = station, values_from = c(mean, sd, se, range))
+```
+
+
+```{r}
+PRL <- PRL %>% rename(discharge_cfs = X_00060_00000)
+PAS <- PAS %>% rename(discharge_cfs = X_00060_00000)
+
+PASC.discharge.daily <- daily.summary(PRL, "discharge_cfs", date_col = "dateTime") %>%
+  rename_with(~ paste0("discharge_", .), -date)
+
+BSL.discharge.daily <- daily.summary(PAS, "discharge_cfs", date_col = "dateTime") %>%
+  rename_with(~ paste0("discharge_", .), -date)
+
+PASC.env.daily <- PASC.env.daily %>% full_join(PASC.discharge.daily, by = "date")
+BSL.env.daily  <- BSL.env.daily  %>% full_join(BSL.discharge.daily, by = "date")
+```
+
+
+
+# Step 9: Match Each Movement to the Correct Estuary System's Environmental Data
+#
+# Each movement is matched to the environmental station nearest to where
+# the fish actually was, within its own estuary system, rather than joined
+# to one combined environmental table across all systems. This avoids a
+# fish being matched to readings from a system it was never near.
+
+```{r check-system-codes}
+flounder.det.clean %>%
+  count(system, sort = TRUE)
+```
+
+If my group's `stations.csv` file with the `RecGroup` column (built in
+ArcMap by Evelyn) is available, it is a more reliable way to assign each
+station to an estuary system than splitting the station name on its first
+underscore, since it was built from real geographic boundaries rather than
+a naming convention. Use it instead if you have it:
+
+```{r optional-recgroup-join}
+# stations <- read.csv("stations.csv")
+# flounder.det.clean <- left_join(flounder.det.clean, stations, by = "Station")
+```
+
+# Still need to check whether pairing BB with BSL actually makes sense —
+# either by finding a USGS station closer to Back Bay (Step 8 pattern),
+# or by checking the RecGroup file / asking Dr. Andres.
+
+```{r match-by-system}
+system.transitions <- system.transitions %>%
+  mutate(BI_flag = if_else(to_system == "BI", 1, 0))
+
+# Adjust these filters once you've confirmed your real system codes above.
+bsl.transitions <- system.transitions %>%
+  filter(from_system %in% c("BSL", "BB"))
+
+mss.transitions <- system.transitions %>%
+  filter(from_system %in% c("MSS", "PR", "PRE"))
+
+BSL_joined <- left_join(bsl.transitions, BSL.env.daily, by = c("to_date" = "date")) %>%
+  left_join(
+    pressure.daily.wide %>%
+      select(date, mslp_mean = mean_GPT, mslp_sd = sd_GPT, mslp_se = se_GPT, mslp_range = range_GPT),
+    by = c("to_date" = "date")
+  )
+
+MSS_joined <- left_join(mss.transitions, PASC.env.daily, by = c("to_date" = "date")) %>%
+  left_join(
+    pressure.daily.wide %>%
+      select(date, mslp_mean = mean_BIX, mslp_sd = sd_BIX, mslp_se = se_BIX, mslp_range = range_BIX),
+    by = c("to_date" = "date")
+  )
+
+env_joined <- bind_rows(BSL_joined, MSS_joined)
+```
+
+
+
+# Step 10: Run the GLMM for Objective 1
+
+```{r scale-predictors}
+env_joined <- env_joined %>%
+  filter(!is.na(temp_mean), !is.na(sal_mean), !is.na(mslp_mean), !is.na(discharge_mean)) %>%
+  mutate(
+    t_scaled = as.numeric(scale(temp_mean)),
+    s_scaled = as.numeric(scale(sal_mean)),
+    p_scaled = as.numeric(scale(mslp_mean)),
+    d_scaled = as.numeric(scale(discharge_mean))
+  )
+```
+
+```{r run-glmm}
+library(glmmTMB)
+
+m1 <- glmmTMB(
+  BI_flag ~ t_scaled + s_scaled + p_scaled + d_scaled + (1 | Full.ID),
+  data = env_joined,
+  family = binomial
+)
+
+summary(m1)
+```
+
+```{r}
+coef_table <- as.data.frame(summary(m1)$coefficients$cond)
+coef_table <- cbind(Term = rownames(coef_table), coef_table)
+rownames(coef_table) <- NULL
+
+knitr::kable(
+  coef_table,
+  digits = 3,
+  caption = "GLMM results for Objective 1 (temperature, salinity, air pressure, and discharge; day length not yet included)"
+)
+```
+
+
+This model asks: does temperature, salinity, air pressure, or discharge change the likelihood that a given movement ended at the barrier islands, once we account for the fact that some fish were tracked for much longer than others? The `(1 | Full.ID)` term is what accounts for that: it stops repeated movements from the same fish from being treated as if they were independent data points.
+
+# Step 11: Check the Model
+
+```{r model-diagnostics}
+library(DHARMa)
+plot(simulateResiduals(m1))
+```
+
+```{r collinearity-check}
+library(performance)
+check_collinearity(m1)
+```
+
+Temperature and salinity are often correlated in coastal water (for example, warmer water near a river mouth is frequently less salty), so it's worth confirming the model can still tell their individual effects apart before trusting the coefficients.
+
+```{r model-predictions}
+library(ggeffects)
+
+ggpredict(m1, terms = c("t_scaled [all]", "s_scaled [-1, 0, 1]")) %>%
+  plot()
+```
+
+# Supporting Analysis for Objectives 2 and 3
+
+```{r}
+abacus.plot <- function(df, system_codes, title) {
+  dat <- df %>% filter(system %in% system_codes)
+
+  fish.order <- dat %>%
+    group_by(Full.ID) %>%
+    summarise(first.seen = min(det.Date), .groups = "drop") %>%
+    arrange(first.seen) %>%
+    pull(Full.ID)
+
+  dat <- dat %>% mutate(Full.ID = factor(Full.ID, levels = fish.order))
+
+  ggplot(dat, aes(x = det.Date, y = Full.ID)) +
+    geom_point(size = 0.8) +
+    labs(title = title, x = "Date", y = "Fish (ordered by first detection)") +
+    theme_minimal() +
+    theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+}
+
+abacus.plot(daily.system, "BSL", "Abacus Plot: St. Louis Bay")
+abacus.plot(daily.system, "BB", "Abacus Plot: Back Bay")
+abacus.plot(daily.system, c("MSS", "PR", "PRE"), "Abacus Plot: Pascagoula")
+```
+
+
+
+```{r}
+bi.return.summary <- system.transitions %>%
+  arrange(Full.ID, to_date) %>%
+  group_by(Full.ID) %>%
+  mutate(
+    next_to_system = lead(to_system),
+    next_to_date = lead(to_date)
+  ) %>%
+  ungroup() %>%
+  filter(to_system == "BI") %>%
+  mutate(
+    dwell.days = as.numeric(next_to_date - to_date),
+    returned.within.2wk = !is.na(next_to_system) & next_to_system != "BI" & dwell.days <= 14
+  )
+
+bi.return.summary %>%
+  summarise(
+    n.bi.arrivals = n(),
+    n.fish.went.to.bi = n_distinct(Full.ID),
+    n.returned.within.2wk = sum(returned.within.2wk, na.rm = TRUE),
+    n.still.unknown = sum(is.na(next_to_system))
+  )
+```
+
+```{r}
+knitr::kable(bi.return.summary %>%
+  summarise(
+    n.bi.arrivals = n(),
+    n.fish.went.to.bi = n_distinct(Full.ID),
+    n.returned.within.2wk = sum(returned.within.2wk, na.rm = TRUE),
+    n.still.unknown = sum(is.na(next_to_system))
+  ))
+```
+
+# Step 12: GAMM Comparison for Objective 1
+
+The GLMM in Step 10 assumes each environmental predictor's effect on the log-odds of an offshore move is a straight line. A GAMM relaxes that,
+letting each predictor's effect curve where the data actually calls for it, while still accounting for repeated measurements per fish the same way the
+GLMM's `(1 | Full.ID)` term did.
+
+```{r run-gamm}
+library(mgcv)
+
+env_joined$Full.ID <- as.factor(env_joined$Full.ID)
+
+m2 <- gam(
+  BI_flag ~ s(t_scaled, k = 4) + s(s_scaled, k = 4) + s(p_scaled, k = 4) + s(d_scaled, k = 4),
+  data = env_joined,
+  family = binomial,
+  method = "REML"
+)
+
+summary(m2)
+
+summary(m2)
+```
+
+The `edf` (effective degrees of freedom) column in the summary is the key
+number to read for each smooth term: an `edf` close to 1 means that
+predictor's effect is close to a straight line (the GLMM's assumption was
+fine for it), while an `edf` noticeably above 1 means the relationship
+actually curves, and the GAMM is picking up something the GLMM couldn't.
+
+```{r gamm-check}
+gam.check(m2, cex = 1, pch = 19)
+```
+
+```{r gamm-plot}
+plot(m2, pages = 1, shade = TRUE)
+```
+
+```{r model-comparison}
+AIC(m1, m2)
+```
+
+A smaller AIC is better. As a rule of thumb, a difference of about 2 or more points is usually considered meaningful; anything closer than that
+is not strong evidence either model fits better, and the simpler GLMM would be the reasonable one to report.
+
+# Step 13: Weighted Residency Index (Objective 3)
+
+The formula for this comes from Kraft et al. (2023, *Movement Ecology*):
+
+$$IWR = \frac{D_d}{D_t} \times \frac{D_i}{D_t}$$
+
+Dd is the number of distinct days a fish was detected, Di is the detectioninterval (days between  its first and last detection), and Dt is the
+monitoring interval those are measured against. IWR ranges from 0 (no residency) to 1 (full residency).
+
+The November 11 class added direction that changes how Dt and the comparison across estuaries need to be handled here:
+
+- Barrier island detections are excluded entirely from this calculation. Dr. Andres was explicit: treat the islands as if they don't exist, and only look at residency within each of the three home estuary systems.
+- Instead of one Dt per fish running from tagging to the end of monitoring, Dt is split into a spawning window and a non-spawning window, based on the calendar month, not the tagging year. A fish gets one IWR for the days it was monitored during the spawning window, and a separate IWR for the days outside it.
+- The three estuaries are not compared directly against each other. Receiver coverage differs too much between St. Louis Bay, Back Bay, and Pascagoula for a cross-system comparison to be trustworthy. Instead, spawning vs. non-spawning residency is compared within each system on its own, three separate comparisons rather than one pooled test.
+- The target output is a small table, roughly 9 values (3 estuaries x pre-spawn / spawn / post-spawn), or 6 if the data are too thin to support three windows, 3 estuaries x spawn / non-spawn.This builds the simpler 2-window version below, as the safer target to guarantee first.
+The two-week post-tagging exclusion still applies, for the same reason as before (recovery from surgery can look like abnormal movement).
+
+```{r residency-trim}
+# Drop the first two weeks of detections after tagging, and drop barrier
+# island detections entirely, per the Nov 11 direction.
+flounder.det.resid <- flounder.det.clean %>%
+  filter(DateTime > Tag.DateTime + days(14)) %>%
+  filter(system != "BI")
+```
+
+## Step 13a: Find the Spawning Window From Your Own Data
+
+Dr. Andres's suggestion was to plot day of year against when fish actually moved to the barrier islands, and pick the window from where those moves cluster, rather than assuming a textbook spawning season.
+```{r bi-moves-calc}
+bi.moves <- system.transitions %>%
+  filter(to_system == "BI") %>%
+  mutate(doy = yday(to_date))
+```
+
+
+```{r spawn-window-plot}
+ggplot(bi.moves, aes(x = doy)) +
+  geom_histogram(binwidth = 7, boundary = 0, fill = "#2C5F2D", color = "white") +
+  scale_x_continuous(
+    breaks = c(1, 32, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335),
+    labels = c("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec")
+  ) +
+  labs(
+    x = "Month (pooled across tagging years)",
+    y = "Number of moves to barrier islands",
+    title = "When fish move offshore, across all years",
+    subtitle = "Each bar covers a 7-day window"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+# October 1 to December 1 comes from where the moves to the barrier
+# islands actually cluster in the histogram above, not a textbook
+# assumption about Southern Flounder's spawning season.
+
+```{r spawn-window-define}
+SPAWN_START_DOY <- yday(as.Date("2024-10-01"))  # start of spawn window, from histogram
+SPAWN_END_DOY <- yday(as.Date("2024-12-01"))    # end of spawn window, from histogram
+
+# Handles a window that wraps over New Year's (e.g., Nov 15 to Jan 15).
+in_spawn_window <- function(date) {
+  d <- yday(date)
+  if (SPAWN_START_DOY > SPAWN_END_DOY) {
+    d >= SPAWN_START_DOY | d <= SPAWN_END_DOY
+  } else {
+    d >= SPAWN_START_DOY & d <= SPAWN_END_DOY
+  }
+}
+```
+
+## Step 13b: Tag Every Detection and Every Monitored Day as Spawn or Non-Spawn
+
+```{r tag-detections}
+flounder.det.resid <- flounder.det.resid %>%
+  mutate(period = if_else(in_spawn_window(DateTime), "spawn", "non-spawn"))
+```
+
+#Dt needs the same spawn/non-spawn split applied to every day a fish was monitored, not just the days it was actually detected, so each fish's total monitored days get counted into the two windows.
+
+```{r monitoring-days-by-period}
+study.end <- max(flounder.det.clean$DateTime, na.rm = TRUE)
+
+days_in_period <- function(start, end, spawn = TRUE) {
+  all_days <- seq(as.Date(start), as.Date(end), by = "day")
+  hits <- in_spawn_window(all_days)
+  if (spawn) sum(hits) else sum(!hits)
+}
+
+fish.span <- flounder.det.clean %>%
+  distinct(Full.ID, Tag.DateTime, Est.Tag.Death) %>%
+  mutate(Dt_end = pmin(Est.Tag.Death, study.end, na.rm = TRUE)) %>%
+  rowwise() %>%
+  mutate(
+    spawn = days_in_period(Tag.DateTime, Dt_end, spawn = TRUE),
+    `non-spawn` = days_in_period(Tag.DateTime, Dt_end, spawn = FALSE)
+  ) %>%
+  ungroup() %>%
+  pivot_longer(c(spawn, `non-spawn`), names_to = "period", values_to = "Dt")
+```
+
+A couple of fish will have `Dt` resting on `study.end` alone, the two reused transmitters flagged back in Step 2 as sharing a transmitter ID. Worth a second look before presenting, same flag as before.
+
+## Step 13c: Compute IWR Per Fish, Per System, Per Period
+
+```{r residency-calc}
+residency.fish.period <- flounder.det.resid %>%
+  group_by(Full.ID, system, period) %>%
+  summarise(
+    Dd = n_distinct(det.Date),
+    first.det = min(DateTime, na.rm = TRUE),
+    last.det = max(DateTime, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(Di = as.numeric(difftime(last.det, first.det, units = "days"))) %>%
+  left_join(fish.span %>% select(Full.ID, period, Dt), by = c("Full.ID", "period")) %>%
+  mutate(
+    # A fish whose tag spans more than one occurrence of a period (e.g.,
+    # two winters) can have a raw first-to-last gap (Di) that stretches
+    # across the off-season in between, making it larger than Dt, which
+    # only counts in-window days. That's not meaningful here, so Di is
+    # capped at Dt to keep IWR inside its defined 0-1 range.
+    Di = pmin(Di, Dt),
+    IWR = (Dd / Dt) * (Di / Dt)
+  )
+```
+
+## Step 13d: The ~6-Value Summary Table
+
+```{r residency-summary}
+residency.summary <- residency.fish.period %>%
+  group_by(system, period) %>%
+  summarise(
+    n.fish = n(),
+    median.IWR = median(IWR, na.rm = TRUE),
+    mean.IWR = mean(IWR, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+knitr::kable(residency.summary, digits = 3,
+  caption = "Weighted residency index by estuary system and season")
+```
+
+This is the table to drop into the group's shared document, three estuaries times spawn/non-spawn.
+
+## Step 13e: Compare Within Each System, Not Across Systems
+
+```{r residency-plot}
+ggplot(residency.fish.period, aes(x = period, y = IWR)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  facet_wrap(~ system) +
+  labs(
+    x = NULL, y = "Weighted residency index (IWR)",
+    title = "Residency by season, within each estuary system",
+    subtitle = "Read spawn vs. non-spawn within one panel only, not panel to panel"
+  )
+```
+```{r}
+residency.fish.period %>% filter(IWR > 1)
+```
+
+
+
+```{r residency-within-system-test}
+for (sys in unique(residency.fish.period$system)) {
+  wide <- residency.fish.period %>%
+    filter(system == sys) %>%
+    select(Full.ID, period, IWR) %>%
+    pivot_wider(names_from = period, values_from = IWR)
+
+  cat("\n---", sys, "---\n")
+
+  if (!all(c("spawn", "non-spawn") %in% names(wide))) {
+    cat("Skipped: this system only has detections in one period, nothing to compare.\n")
+    next
+  }
+
+  wide <- wide %>% filter(!is.na(spawn), !is.na(`non-spawn`))
+
+  if (nrow(wide) < 2) {
+    cat("Skipped: fewer than 2 fish have both a spawn and non-spawn value.\n")
+    next
+  }
+
+  print(wilcox.test(wide$spawn, wide$`non-spawn`, paired = TRUE))
+}
+```
+
+# Next Steps
+
+- Day length (photoperiod) still missing from GLMM/GAMM; needs `suncalc`.
+  Adding it means rerunning both models.
+- Step 9 estuary grouping is a best guess; station codes (incl. "BI") and
+  Back Bay's station need checking against the full dataset or Evelyn's
+  `RecGroup` file.
+- Two-week barrier-island return cutoff is a first pass at Mike's Oct 26
+  instruction, not confirmed with him yet. Not started: dropping fish
+  whose detections don't span into the next winter.
+- Step 13 follows the Nov 11 direction (BI dropped, Dt split spawn/non-
+  spawn, within-system comparisons only). `SPAWN_START_DOY`/`END_DOY` are
+  now set from the histogram (Oct 1-Dec 1), not placeholders. Still open:
+  `study.end` stands in for the real last-monitoring-day; per-receiver
+  index is blocked on data the group doesn't have.
+- Someone's 14-day inshore/offshore cutoff fits Objective 1 better
+  than the 3-day one; worth testing here too, with 7 days, before
+  finalizing.
